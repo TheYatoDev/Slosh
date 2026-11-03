@@ -105,5 +105,6 @@ measurements show are unproven.
 | 14 | ARCHITECTURE_DECISION.md | decision record |
 | 15 | PHASE1_IMPLEMENTATION_PLAN.md | Stage 1 done, Stages 2–5 planned |
 | 16 | RESEARCH_SUMMARY.md | this file |
+| 17 | PAINTER_DESIGN.md | Slosh Paint (Fluid Painter-style strokes): milestone 1 done and validated |
 
 Screenshot of the running prototype: `media/demo_64x64x48.png`.

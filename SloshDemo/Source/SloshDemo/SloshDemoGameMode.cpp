@@ -14,6 +14,18 @@
 #include "DynamicRHI.h"
 #include "HAL/PlatformTime.h"
 #include "Modules/ModuleManager.h"
+#include "Animation/AnimSequence.h"
+#include "Animation/SkeletalMeshActor.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Engine/SkeletalMesh.h"
+#include "Misc/Paths.h"
+#include "SloshPaintBrushComponent.h"
+#include "SloshPaintComponent.h"
+#include "SloshPaintLibrary.h"
+#include "SloshPaintPreset.h"
+#include "UnrealClient.h"
+#include "EngineUtils.h"
+#include "Materials/MaterialInterface.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSloshDemo, Log, All);
 
@@ -60,6 +72,11 @@ void ASloshDemoGameMode::StartPlay()
 	UWorld* World = GetWorld();
 	bAutoTest = FParse::Param(FCommandLine::Get(), TEXT("SloshAutoTest"));
 	FParse::Value(FCommandLine::Get(), TEXT("SloshAutoTestSeconds="), AutoTestSeconds);
+	if (FParse::Param(FCommandLine::Get(), TEXT("SloshPaintTest")))
+	{
+		StartPaintTest();
+		return;
+	}
 
 	FActorSpawnParameters Params;
 	Params.bDeferConstruction = true;
@@ -196,6 +213,11 @@ void ASloshDemoGameMode::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 	Elapsed += DeltaSeconds;
+	if (bPaintTest)
+	{
+		TickPaintTest();
+		return;
+	}
 
 	// Kinematic paddle sweeping through the pool (moving obstacle, one-way).
 	if (Paddle)
@@ -308,5 +330,199 @@ void ASloshDemoGameMode::Tick(float DeltaSeconds)
 			bAutoTest = false;
 			FPlatformMisc::RequestExit(false, TEXT("SloshAutoTest"));
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slosh Paint test scene (-SloshPaintTest). Uses the FluidNinja sample mannequin when present (local test content).
+// ---------------------------------------------------------------------------------------------
+namespace
+{
+	USloshPaintPreset* LoadPaintPreset(const TCHAR* Pack, const TCHAR* Name)
+	{
+		return LoadObject<USloshPaintPreset>(nullptr, *FString::Printf(TEXT("/Slosh/Paint/Presets/%s/DA_SloshPaint_%s.DA_SloshPaint_%s"), Pack, Name, Name));
+	}
+}
+
+void ASloshDemoGameMode::StartPaintTest()
+{
+	bPaintTest = true;
+	UWorld* World = GetWorld();
+
+	USkeletalMesh* Mesh = LoadObject<USkeletalMesh>(nullptr, TEXT("/Game/FluidNinjaLive/Meshes/Mannequin/Mesh/SKM_Manny_Simple.SKM_Manny_Simple"));
+	UAnimSequence* Anim = LoadObject<UAnimSequence>(nullptr, TEXT("/Game/FluidNinjaLive/Meshes/Mannequin/Animations/MF_Unarmed_Walk_Fwd.MF_Unarmed_Walk_Fwd"));
+	if (Mesh)
+	{
+		// Faces -X (towards the camera).
+		ASkeletalMeshActor* Character = World->SpawnActor<ASkeletalMeshActor>(FVector(0, 0, 0), FRotator(0, 90, 0));
+		USkeletalMeshComponent* Skel = Character->GetSkeletalMeshComponent();
+		Skel->SetSkeletalMesh(Mesh);
+		Skel->bEnableUpdateRateOptimizations = false;
+		if (UMaterialInterface* Dark = LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/SloshTest/M_TestSurface.M_TestSurface")))
+		{
+			for (int32 I = 0; I < Skel->GetNumMaterials(); ++I)
+			{
+				Skel->SetMaterial(I, Dark);   // contrast for light presets
+			}
+		}
+		if (Anim)
+		{
+			Skel->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+			Skel->PlayAnimation(Anim, true);
+			Skel->SetPlayRate(0.5f);
+		}
+		PaintCharacter = Character;
+	}
+	UE_LOG(LogSloshDemo, Display, TEXT("paint test: character %s, animation %s"), Mesh ? TEXT("loaded") : TEXT("MISSING"), Anim ? TEXT("loaded") : TEXT("MISSING"));
+
+	AStaticMeshActor* Sphere = World->SpawnActor<AStaticMeshActor>(FVector(0, 110, 110), FRotator::ZeroRotator);
+	Sphere->GetStaticMeshComponent()->SetMobility(EComponentMobility::Movable);
+	Sphere->GetStaticMeshComponent()->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Sphere.Sphere")));
+	Sphere->SetActorScale3D(FVector(0.6));
+	Sphere->GetStaticMeshComponent()->SetMaterial(0, LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/SloshTest/M_TestSurface.M_TestSurface")));
+
+	ACameraActor* Camera = World->SpawnActor<ACameraActor>(FVector(-190, 50, 120), FRotator::ZeroRotator);
+	Camera->SetActorRotation((FVector(0, 50, 112) - Camera->GetActorLocation()).Rotation());
+	if (APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0))
+	{
+		PC->SetViewTarget(Camera);
+		if (APawn* Pawn = PC->GetPawn())
+		{
+			Pawn->SetActorHiddenInGame(true);   // the default pawn spawns at the origin, inside the character
+			Pawn->SetActorEnableCollision(false);
+		}
+	}
+	// The nozzle Blueprint (auto-paint along its forward axis) sweeps across the lower half of the sphere.
+	if (UClass* NozzleClass = LoadClass<AActor>(nullptr, TEXT("/Slosh/Paint/Blueprints/BP_SloshNozzle.BP_SloshNozzle_C")))
+	{
+		PaintNozzle = World->SpawnActor<AActor>(NozzleClass, FVector(-60, 90, 95), FRotator::ZeroRotator);
+	}
+	UE_LOG(LogSloshDemo, Display, TEXT("paint test: nozzle %s"), PaintNozzle ? TEXT("spawned") : TEXT("MISSING"));
+	AutoTestSeconds = FMath::Max(AutoTestSeconds, 6.0);
+}
+
+void ASloshDemoGameMode::PaintTestStroke(USloshPaintPreset* Preset, const TArray<FVector>& Targets, const FVector& RayDir)
+{
+	USloshPaintComponent* Paint = nullptr;
+	int32 Stroke = 0;
+	for (const FVector& Target : Targets)
+	{
+		const FSloshPaintHit Hit = USloshPaintLibrary::TracePaintSurface(this, Target - RayDir * 150.0, Target + RayDir * 150.0, ECC_Visibility, {}, true);
+		if (!Hit.bHit)
+		{
+			continue;
+		}
+		if (!Paint)
+		{
+			Paint = USloshPaintComponent::FindOrAddPaintComponent(Hit.Component);
+			Paint->UnitScale = 6.0f;
+			Stroke = Paint->BeginStroke(Preset, Hit.Location, Hit.Normal, 1.0f, Hit.Bone);
+		}
+		else
+		{
+			Paint->AddStrokePoint(Stroke, Hit.Location, Hit.Normal, 1.0f, Hit.Bone);
+		}
+	}
+	if (!Paint)
+	{
+		UE_LOG(LogSloshDemo, Warning, TEXT("paint test: stroke missed everything (%d rays)"), Targets.Num());
+		return;
+	}
+	Paint->EndStroke(Stroke);
+	TSet<FName> Bones;
+	const FSloshPaintStroke* Data = Paint->FindStroke(Stroke);
+	for (const FSloshPaintPoint& Point : Data->Points)
+	{
+		Bones.Add(Point.Bone);
+	}
+	FString BoneList;
+	for (const FName& Bone : Bones)
+	{
+		BoneList += Bone.ToString() + TEXT(" ");
+	}
+	UE_LOG(LogSloshDemo, Display, TEXT("paint test: stroke %d on %s, %d/%d points, bones: %s"), Stroke, *GetNameSafe(Paint->GetAttachParent()),
+		Data->Points.Num(), Targets.Num(), *BoneList);
+}
+
+void ASloshDemoGameMode::TickPaintTest()
+{
+	if (PaintTestStage == 0 && Elapsed > 1.0)
+	{
+		PaintTestStage = 1;
+		USloshPaintPreset* Cum = LoadPaintPreset(TEXT("NSFW"), TEXT("Cum"));
+		USloshPaintPreset* Honey = LoadPaintPreset(TEXT("Regular"), TEXT("Honey"));
+		USloshPaintPreset* Ketchup = LoadPaintPreset(TEXT("Regular"), TEXT("Ketchup"));
+		const FVector Dir(1, 0, 0);
+		// Character: a band across the chest, a line down one arm, a wavy line down the belly.
+		TArray<FVector> Chest, Arm, Belly;
+		for (int32 K = 0; K <= 40; ++K)
+		{
+			const float U = K / 40.0f;
+			Chest.Add(FVector(0, FMath::Lerp(-16.0f, 16.0f, U), 138 + 5 * FMath::Sin(U * 6.0f)));
+			Arm.Add(FVector(0, FMath::Lerp(-24.0f, -40.0f, U), FMath::Lerp(140.0f, 100.0f, U)));
+			Belly.Add(FVector(0, 3 + 2 * FMath::Sin(U * 9.0f), FMath::Lerp(125.0f, 100.0f, U)));
+		}
+		PaintTestStroke(Cum, Chest, Dir);
+		PaintTestStroke(Ketchup, Arm, Dir);
+		PaintTestStroke(Cum, Belly, Dir);
+		// Sphere: a swirl and a drip.
+		TArray<FVector> Swirl, Drip;
+		for (int32 K = 0; K <= 60; ++K)
+		{
+			const float U = K / 60.0f;
+			Swirl.Add(FVector(0, 110 + 18 * FMath::Cos(U * 9.0f), 115 + 14 * FMath::Sin(U * 9.0f)));
+			Drip.Add(FVector(0, 100, FMath::Lerp(135.0f, 90.0f, U)));
+		}
+		PaintTestStroke(Honey, Swirl, Dir);
+		PaintTestStroke(Honey, Drip, Dir);
+	}
+	if (PaintNozzle)
+	{
+		// Sweep for 2.5 s, then stop (ends the stroke).
+		const double U = FMath::Clamp((Elapsed - 0.5) / 2.5, 0.0, 1.0);
+		PaintNozzle->SetActorLocation(FVector(-60, FMath::Lerp(88.0, 132.0, U), 95 + 6 * FMath::Sin(U * 12.0)));
+		if (U >= 1.0)
+		{
+			if (USloshPaintBrushComponent* Brush = PaintNozzle->FindComponentByClass<USloshPaintBrushComponent>(); Brush && Brush->IsPainting())
+			{
+				Brush->StopPainting();
+				UE_LOG(LogSloshDemo, Display, TEXT("paint test: nozzle stroke finished"));
+			}
+		}
+	}
+	const FString BenchDir = FPaths::ProjectSavedDir() / TEXT("Bench");
+	if (PaintTestStage == 1 && Elapsed > 3.5)
+	{
+		PaintTestStage = 2;
+		FScreenshotRequest::RequestScreenshot(BenchDir / TEXT("PaintTest_A.png"), false, false);
+	}
+	if (PaintTestStage == 2 && Elapsed > 4.7)
+	{
+		PaintTestStage = 3;
+		FScreenshotRequest::RequestScreenshot(BenchDir / TEXT("PaintTest_B.png"), false, false);
+		if (PaintCharacter)
+		{
+			TArray<USceneComponent*> Components;
+			PaintCharacter->GetComponents(Components);
+			UE_LOG(LogSloshDemo, Display, TEXT("paint test: character has %d scene components after painting"), Components.Num());
+		}
+		for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+		{
+			TArray<UPrimitiveComponent*> Prims;
+			It->GetComponents(Prims);
+			for (UPrimitiveComponent* Prim : Prims)
+			{
+				if (Prim->IsVisible())
+				{
+					UE_LOG(LogSloshDemo, Display, TEXT("paint test: %s.%s (%s) parent=%s socket=%s bounds=%s r=%.1f mat=%s"), *It->GetName(), *Prim->GetName(),
+						*Prim->GetClass()->GetName(), *GetNameSafe(Prim->GetAttachParent()), *Prim->GetAttachSocketName().ToString(),
+						*Prim->Bounds.Origin.ToString(), Prim->Bounds.SphereRadius, *GetNameSafe(Prim->GetMaterial(0)));
+				}
+			}
+		}
+	}
+	if (Elapsed > AutoTestSeconds)
+	{
+		FPlatformMisc::RequestExit(false, TEXT("SloshPaintTest"));
 	}
 }

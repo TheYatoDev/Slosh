@@ -24,6 +24,20 @@ public:
 	virtual void Tick(float DeltaSeconds) override;
 
 private:
+	/** -SloshPaintTest: an animated character and a sphere painted through traces, two screenshots, then exit. */
+	void StartPaintTest();
+	void TickPaintTest();
+	void PaintTestStroke(class USloshPaintPreset* Preset, const TArray<FVector>& Targets, const FVector& RayDir);
+
+	bool bPaintTest = false;
+	int32 PaintTestStage = 0;
+
+	UPROPERTY()
+	TObjectPtr<AActor> PaintCharacter;
+
+	UPROPERTY()
+	TObjectPtr<AActor> PaintNozzle;
+
 	AStaticMeshActor* SpawnBody(const TCHAR* MeshPath, const FVector& Location, float Scale, float MassKg, bool bSimulate, bool bSphere);
 
 	UPROPERTY()

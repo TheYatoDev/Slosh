@@ -27,6 +27,8 @@ evidence from the Phase 1 prototype run on 2026-11-03 (RTX 5060 Laptop, UE 5.8.4
 | R-20 | Screen-space splat cost explodes for close-up cameras (per-thread pixel loops up to 64×64) | M | M | MaxSplatPixels cap (32 px); raster sprite path | E6b | Open |
 | R-21 | High resolution (256×256×128, 1.25 cm cells, CFL 4): body impact drove particles to the 20 m/s clamp for good, pinning 4 substeps (≈ 50 ms frames) | M | M | RK2 midpoint blends to Euler when the midpoint is > 1 cell away, and unknown faces take the particle velocity (PERFORMANCE_PLAN §10d); `GetClampedParticleCount()` monitors it | E6 | **Mitigated:** 0 clamped particles, 1–2 substeps ≈ 2.5 s after impact, 20–31 ms frames |
 | R-22 | Slow frames simulate more time, need more substeps and slow further (feedback spiral) | M | M | `MaxFrameDt` caps simulated time per frame at 1/30 s (slow motion below 30 FPS) | E6 | **Mitigated:** 9.8M-particle calm frame 70 → 36 ms (1 substep). Trade-off: below 30 FPS the liquid is not real-time |
+| R-23 | Slosh Paint presets are ported from Fluid Painter, a paid Blender add-on whose zips carry no licence text; the repository is public | H | M | Keep preset content local until redistribution rights are confirmed (PAINTER_DESIGN §5) | — | Open |
+| R-24 | Slosh Paint meshing is CPU marching cubes; animated drops and Reveal rebuild strokes every frame | M | M | Worker task, one build in flight, per-stroke cache (only changed strokes rebuild), `MaxCellsPerStroke` cap, `QualityScale` | paint test | Open: static paint costs nothing per frame; animated strokes may lag 1–2 frames |
 
 ## Networking and determinism (brief §12)
 
