@@ -1,0 +1,230 @@
+// Copyright notice: see Plugins/Slosh/NOTICE.md.
+// Screen-space fluid rendering (after van der Laan, Green & Sainz 2009): sphere depth splat,
+// bilateral depth smoothing, normal reconstruction and refractive/absorptive composite.
+// Everything here reads simulation output only; it never writes simulation state.
+
+#include "SloshCommon.ush"
+
+#define RENDER_THREADS_2D 8
+#define THICKNESS_FIXED_SCALE 16.0   // thickness stored as 1/16 view units (cm)
+#define NO_FLUID_DEPTH 3.0e38
+
+// Shared
+int2   ViewRectMin;
+int2   ViewSize;
+float4x4 SimToView;
+float4x4 ViewToClip;
+float4x4 ViewToWorld;
+float4 InvDeviceZToWorldZTransform;
+
+// Splat
+uint   NumParticles;
+float  ParticleViewRadius;
+float  MaxSplatPixels;
+StructuredBuffer<FSloshParticlePacked> Particles;
+Texture2D SceneDepthTexture;
+RWTexture2D<uint> FluidDepthUint;
+RWTexture2D<uint> FluidThicknessUint;
+
+// Resolve / smooth
+Texture2D<uint>  DepthUintIn;
+Texture2D<uint>  ThicknessUintIn;
+Texture2D<float> DepthIn;
+RWTexture2D<float> DepthOut;
+RWTexture2D<float> ThicknessOut;
+int2   FilterDirection;
+int    FilterRadius;
+float  DepthFalloff;
+
+// Composite
+Texture2D<float> FluidDepth;
+Texture2D<float> FluidThickness;
+Texture2D SceneColorTexture;
+RWTexture2D<float4> OutputColor;
+float3 LightDirectionView;
+float3 LightColor;
+float3 AbsorptionPerMeter;
+float3 ScatterColor;
+float3 SkyZenithColor;
+float3 SkyHorizonColor;
+float  RefractionStrength;
+float  SpecularPower;
+float  FresnelF0;
+
+float DeviceZToViewZ(float DeviceZ)
+{
+	return DeviceZ * InvDeviceZToWorldZTransform[0] + InvDeviceZToWorldZTransform[1]
+		+ 1.0f / (DeviceZ * InvDeviceZToWorldZTransform[2] - InvDeviceZToWorldZTransform[3]);
+}
+
+float3 ViewPositionFromDepth(int2 Pixel, float ViewZ)
+{
+	float2 Uv = (float2(Pixel - ViewRectMin) + 0.5) / float2(ViewSize);
+	float2 Ndc = float2(Uv.x * 2.0 - 1.0, 1.0 - Uv.y * 2.0);
+	float X = (Ndc.x - ViewToClip[2][0]) * ViewZ / ViewToClip[0][0];
+	float Y = (Ndc.y - ViewToClip[2][1]) * ViewZ / ViewToClip[1][1];
+	return float3(X, Y, ViewZ);
+}
+
+// ---------------------------------------------------------------------------------------------
+// One thread per particle; splats a view-facing sphere into a min-depth (uint bits of positive
+// float) target and accumulates thickness. Occluded fragments are rejected against scene depth.
+// ---------------------------------------------------------------------------------------------
+[numthreads(SLOSH_THREADS, 1, 1)]
+void SplatParticlesCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I = LinearThreadId(DTid, SLOSH_THREADS);
+	if (I >= NumParticles)
+	{
+		return;
+	}
+	float3 Vp = mul(float4(Particles[I].Pos, 1.0), SimToView).xyz;
+	if (Vp.z < ParticleViewRadius + 1.0)
+	{
+		return;
+	}
+	float4 Clip = mul(float4(Vp, 1.0), ViewToClip);
+	float2 Ndc = Clip.xy / Clip.w;
+	float2 Center = float2((Ndc.x * 0.5 + 0.5) * ViewSize.x, (0.5 - Ndc.y * 0.5) * ViewSize.y) + float2(ViewRectMin);
+	float RadiusPx = ParticleViewRadius * ViewToClip[0][0] * 0.5 * float(ViewSize.x) / Vp.z;
+	float Clamped = min(RadiusPx, MaxSplatPixels);
+
+	int2 PMin = max(int2(floor(Center - Clamped)), ViewRectMin);
+	int2 PMax = min(int2(ceil(Center + Clamped)), ViewRectMin + ViewSize - 1);
+	if (any(PMin > PMax))
+	{
+		return;
+	}
+	float InvR2 = 1.0 / max(Clamped * Clamped, 0.25);
+
+	for (int Y = PMin.y; Y <= PMax.y; ++Y)
+	{
+		for (int X = PMin.x; X <= PMax.x; ++X)
+		{
+			float2 D = float2(X, Y) + 0.5 - Center;
+			float Q2 = dot(D, D) * InvR2;
+			if (Q2 > 1.0)
+			{
+				continue;
+			}
+			float Dz = ParticleViewRadius * sqrt(1.0 - Q2);
+			float Depth = Vp.z - Dz;
+			float SceneZ = DeviceZToViewZ(SceneDepthTexture.Load(int3(X, Y, 0)).r);
+			if (Depth > SceneZ)
+			{
+				continue;
+			}
+			InterlockedMin(FluidDepthUint[int2(X, Y)], asuint(Depth));
+			uint Thick = uint(min(2.0 * Dz, SceneZ - Depth) * THICKNESS_FIXED_SCALE);
+			InterlockedAdd(FluidThicknessUint[int2(X, Y)], Thick);
+		}
+	}
+}
+
+[numthreads(RENDER_THREADS_2D, RENDER_THREADS_2D, 1)]
+void ResolveCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (any(int2(DTid.xy) >= ViewSize))
+	{
+		return;
+	}
+	int2 Pixel = int2(DTid.xy) + ViewRectMin;
+	uint D = DepthUintIn.Load(int3(Pixel, 0));
+	DepthOut[Pixel] = D == 0xFFFFFFFFu ? NO_FLUID_DEPTH : asfloat(D);
+	ThicknessOut[Pixel] = float(ThicknessUintIn.Load(int3(Pixel, 0))) / THICKNESS_FIXED_SCALE;
+}
+
+// Separable bilateral filter on view depth. Background pixels are neither filtered nor used.
+[numthreads(RENDER_THREADS_2D, RENDER_THREADS_2D, 1)]
+void SmoothDepthCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (any(int2(DTid.xy) >= ViewSize))
+	{
+		return;
+	}
+	int2 Pixel = int2(DTid.xy) + ViewRectMin;
+	float Center = DepthIn.Load(int3(Pixel, 0));
+	if (Center >= NO_FLUID_DEPTH)
+	{
+		DepthOut[Pixel] = Center;
+		return;
+	}
+	float Sigma = max(float(FilterRadius) * 0.5, 0.5);
+	float Sum = 0.0;
+	float WSum = 0.0;
+	for (int O = -FilterRadius; O <= FilterRadius; ++O)
+	{
+		int2 P = clamp(Pixel + FilterDirection * O, ViewRectMin, ViewRectMin + ViewSize - 1);
+		float S = DepthIn.Load(int3(P, 0));
+		if (S >= NO_FLUID_DEPTH)
+		{
+			continue;
+		}
+		float Dd = (S - Center) / DepthFalloff;
+		float W = exp(-float(O * O) / (2.0 * Sigma * Sigma)) * exp(-Dd * Dd);
+		Sum += S * W;
+		WSum += W;
+	}
+	DepthOut[Pixel] = WSum > 0.0 ? Sum / WSum : Center;
+}
+
+float3 FetchViewPosition(int2 Pixel)
+{
+	int2 P = clamp(Pixel, ViewRectMin, ViewRectMin + ViewSize - 1);
+	return ViewPositionFromDepth(P, FluidDepth.Load(int3(P, 0)));
+}
+
+[numthreads(RENDER_THREADS_2D, RENDER_THREADS_2D, 1)]
+void CompositeCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (any(int2(DTid.xy) >= ViewSize))
+	{
+		return;
+	}
+	int2 Pixel = int2(DTid.xy) + ViewRectMin;
+	float4 Scene = SceneColorTexture.Load(int3(Pixel, 0));
+	float Depth = FluidDepth.Load(int3(Pixel, 0));
+	if (Depth >= NO_FLUID_DEPTH)
+	{
+		OutputColor[Pixel] = Scene;
+		return;
+	}
+
+	// Normal from the smaller one-sided depth difference to avoid smearing across silhouettes.
+	float3 P = ViewPositionFromDepth(Pixel, Depth);
+	float3 Px0 = FetchViewPosition(Pixel - int2(1, 0));
+	float3 Px1 = FetchViewPosition(Pixel + int2(1, 0));
+	float3 Py0 = FetchViewPosition(Pixel - int2(0, 1));
+	float3 Py1 = FetchViewPosition(Pixel + int2(0, 1));
+	float3 Ddx = abs(Px1.z - P.z) < abs(P.z - Px0.z) ? Px1 - P : P - Px0;
+	float3 Ddy = abs(Py1.z - P.z) < abs(P.z - Py0.z) ? Py1 - P : P - Py0;
+	float3 N = normalize(cross(Ddy, Ddx));
+	if (N.z > 0.0)
+	{
+		N = -N;
+	}
+
+	float3 V = -normalize(P);
+	float NoV = saturate(dot(N, V));
+	float Fresnel = FresnelF0 + (1.0 - FresnelF0) * pow(1.0 - NoV, 5.0);
+
+	float ThicknessCm = FluidThickness.Load(int3(Pixel, 0));
+	float2 Offset = N.xy * float2(1.0, -1.0) * RefractionStrength * min(ThicknessCm, 50.0) / max(P.z, 1.0) * float(ViewSize.x);
+	int2 RefractPixel = clamp(Pixel + int2(Offset), ViewRectMin, ViewRectMin + ViewSize - 1);
+	float RefractSceneZ = DeviceZToViewZ(SceneDepthTexture.Load(int3(RefractPixel, 0)).r);
+	if (RefractSceneZ < Depth)
+	{
+		RefractPixel = Pixel;
+	}
+	float3 Behind = SceneColorTexture.Load(int3(RefractPixel, 0)).rgb;
+	float3 Transmittance = exp(-AbsorptionPerMeter * ThicknessCm * 0.01);
+	float3 Refracted = Behind * Transmittance + ScatterColor * (1.0 - Transmittance);
+
+	float3 R = reflect(-V, N);
+	float3 Rw = normalize(mul(float4(R, 0.0), ViewToWorld).xyz);
+	float3 Sky = lerp(SkyHorizonColor, SkyZenithColor, saturate(Rw.z));
+	float3 Spec = LightColor * pow(saturate(dot(R, -LightDirectionView)), SpecularPower);
+
+	float3 Color = lerp(Refracted, Sky, Fresnel) + Spec * Fresnel;
+	OutputColor[Pixel] = float4(Color, Scene.a);
+}

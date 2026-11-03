@@ -1,0 +1,30 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "Slosh (GPU FLIP/APIC)",
+	"Description": "Experimental GPU-native FLIP/APIC liquid simulation with analytic rigid-body coupling and screen-space fluid rendering. Phase 1 prototype.",
+	"Category": "Physics",
+	"CreatedBy": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "SloshCore",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "SloshRender",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "Slosh",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

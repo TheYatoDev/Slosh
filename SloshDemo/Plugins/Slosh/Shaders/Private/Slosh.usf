@@ -1,0 +1,1682 @@
+// Copyright notice: see Plugins/Slosh/NOTICE.md.
+// GPU FLIP/APIC liquid solver kernels.
+//
+// Algorithmic reference: Blender FLIP Fluids engine (MIT), src/engine/fluidsimulation.cpp step order
+// (P2G -> mark cells -> body forces -> viscosity -> pressure -> extrapolate -> G2P/advect).
+// The GPU formulation (fixed-point atomic P2G, red-black SOR pressure, analytic SDF colliders) is new code.
+
+#include "SloshCommon.ush"
+
+// ---------------------------------------------------------------------------------------------
+// Parameters (see FSloshPassParameters in SloshShaders.h)
+// ---------------------------------------------------------------------------------------------
+int3   GridDim;
+float  CellSize;
+float  InvCellSize;
+uint   TotalFaces;     // 3 * PoolCells (Accum weights start here)
+uint   PoolCells;      // NumPoolBricks * 512
+uint   NumPoolBricks;  // pool slots including the null slot 0
+uint   NumParticles;
+uint   ParticleCapacity;
+uint   NumColliders;
+float  Dt;
+float3 Gravity;
+float  FlipRatio;
+uint   bUseAPIC;
+float  MaxSpeed;
+float  Friction;
+float  ParticleRadius;
+float  ViscosityAlpha;
+float  SORWeight;
+uint   Parity;
+float  WarmStartScale;
+float  PressureToPascal;
+float  DensityCorrection;
+float  TargetParticlesPerCell;
+float  DensityDeadband;
+float  CouplingScale;
+uint   ExtrapIteration;
+uint   bSmoothCoupling;
+uint   bGhostFluid;
+uint   bApplyDensityProjection;
+uint   bSparse;
+int3   BrickDim;
+uint   NumBricks;
+float  DensityRelaxation;
+
+uint   EmitCount;
+uint   EmitCursor;
+uint   EmitMode;
+uint   EmitSeed;
+float3 EmitCenter;
+float3 EmitExtent;
+float3 EmitVelocity;
+int3   EmitCellMin;
+int3   EmitCellDims;
+
+RWStructuredBuffer<FSloshParticlePacked> Particles;
+RWStructuredBuffer<float> Vel;       // current face velocities
+RWStructuredBuffer<float> VelOld;    // face velocities right after P2G (FLIP reference)
+RWStructuredBuffer<float> VelSrc;    // ping-pong source (viscosity / extrapolation)
+RWStructuredBuffer<float> VelDst;    // ping-pong destination
+RWStructuredBuffer<int>   Accum;     // [0,TotalFaces): momentum, [TotalFaces,2*TotalFaces): weight
+RWStructuredBuffer<uint>  FaceFlags;
+RWStructuredBuffer<float> FaceWeight; // P2G weight sum per face (smooth particle density, rest = particles per cell)
+RWStructuredBuffer<uint>  CellType;
+RWStructuredBuffer<int>   CellCount;
+RWStructuredBuffer<float> Pressure;  // scaled pressure p_hat = p * dt / (rho * h)
+RWStructuredBuffer<float> Divergence;
+RWStructuredBuffer<float> CellDiag;  // pressure-operator diagonal per fluid cell (ghost-fluid weighted)
+RWStructuredBuffer<float> DensityQ;  // density-projection potential (cells); particle shift = -grad(q)
+RWStructuredBuffer<int>   Coupling;  // per collider: F.xyz, T.xyz, wetFaces, submergedCells, vSum.xyz, solidCells, submergedOffsetSum.xyz
+RWStructuredBuffer<uint>  Stats;     // [0] max particle speed (float bits), [1] fluid cell count, [2..4] residual
+StructuredBuffer<FSloshCollider> Colliders;
+// Brick pool (read-only in the solver kernels; SM5 allows 8 UAVs per kernel).
+StructuredBuffer<uint> BrickTable;      // per brick: pool slot, 0 = no storage (null brick)
+StructuredBuffer<uint> SlotBrick;       // per pool slot: brick index, SLOSH_NO_BRICK = free
+StructuredBuffer<uint> ActiveBricks;    // [0] = allocated brick count, [1 + i] = brick index
+// Allocator state (written only by the pool kernels, which bind these instead of the SRVs above).
+RWStructuredBuffer<uint> RWBrickTable;
+RWStructuredBuffer<uint> RWSlotBrick;
+RWStructuredBuffer<uint> RWActiveBricks;
+RWStructuredBuffer<uint> FreeSlots;     // [0] = free slot count, [1 .. count] = free slots (stack)
+RWStructuredBuffer<uint> BrickTouch;    // per brick: holds particles this substep
+RWStructuredBuffer<uint> BrickWant;     // per brick: touched brick within one brick (needs storage)
+RWStructuredBuffer<uint> NewSlots;      // [0] = slots allocated this substep, [1 + i] = slot
+RWBuffer<uint> SparseArgsOut;           // indirect dispatch args: active cells, active MG level-1 cells, new slots
+
+// ---------------------------------------------------------------------------------------------
+// Sparse brick storage. The grid is tiled into 8^3 bricks and only bricks near particles own storage.
+// Every per-cell buffer holds NumPoolBricks slots of 512 cells (slot s = cells [512 s, 512 s + 512));
+// per-face buffers hold three such planes, one per axis, and face (Axis, F) lives with cell F (each cell
+// owns its three min faces). BrickTable maps a brick to its slot. Slot 0 is the null brick: unallocated
+// and out-of-grid cells resolve to it, nothing writes it, and its zeros read as air, no velocity, no
+// weight. Max-side domain boundary faces are not stored: they only border the solid wall cells.
+// ---------------------------------------------------------------------------------------------
+#define SLOSH_BRICK 8
+#define SLOSH_BRICK_CELLS 512
+#define SLOSH_NO_BRICK 0xFFFFFFFFu
+
+bool InGrid(int3 C)
+{
+	return all(C >= 0) && all(C < GridDim);
+}
+
+uint BrickIndexOf(int3 B)
+{
+	return uint(B.x + BrickDim.x * (B.y + BrickDim.y * B.z));
+}
+
+int3 BrickCoordOf(uint Brick)
+{
+	return int3(int(Brick % uint(BrickDim.x)), int((Brick / uint(BrickDim.x)) % uint(BrickDim.y)), int(Brick / uint(BrickDim.x * BrickDim.y)));
+}
+
+uint LocalIndexOf(int3 C)
+{
+	int3 L = C & (SLOSH_BRICK - 1);
+	return uint(L.x + SLOSH_BRICK * (L.y + SLOSH_BRICK * L.z));
+}
+
+int3 LocalCoordOf(uint L)
+{
+	return int3(int(L % 8u), int((L / 8u) % 8u), int(L / 64u));
+}
+
+uint CellIndex(int3 C)
+{
+	uint Slot = 0u;
+	if (InGrid(C))
+	{
+		Slot = BrickTable[BrickIndexOf(C >> 3)];
+	}
+	return Slot * SLOSH_BRICK_CELLS + LocalIndexOf(C);
+}
+
+// Null-brick indices (unallocated or outside the grid); writes there are dropped.
+bool IsNullCell(uint Index)
+{
+	return Index < SLOSH_BRICK_CELLS;
+}
+
+// Maps a thread of a grid pass to an allocated cell, either through the active-brick list (indirect
+// dispatch, bSparse) or by scanning every pool slot (direct dispatch over (NumPoolBricks - 1) * 512
+// threads; free slots exit). Both visit exactly the allocated bricks.
+bool SparseCell(uint Thread, out uint Index, out int3 C)
+{
+	Index = 0u;
+	C = int3(0, 0, 0);
+	uint Entry = Thread / SLOSH_BRICK_CELLS;
+	uint L = Thread % SLOSH_BRICK_CELLS;
+	uint Brick;
+	uint Slot;
+	if (bSparse != 0u)
+	{
+		if (Entry >= ActiveBricks[0])
+		{
+			return false;
+		}
+		Brick = ActiveBricks[1u + Entry];
+		Slot = BrickTable[Brick];
+	}
+	else
+	{
+		Slot = 1u + Entry;
+		if (Slot >= NumPoolBricks)
+		{
+			return false;
+		}
+		Brick = SlotBrick[Slot];
+		if (Brick == SLOSH_NO_BRICK)
+		{
+			return false;
+		}
+	}
+	C = BrickCoordOf(Brick) * SLOSH_BRICK + LocalCoordOf(L);
+	Index = Slot * SLOSH_BRICK_CELLS + L;
+	return InGrid(C);
+}
+
+uint FaceIndex(uint Axis, int3 F)
+{
+	return Axis * PoolCells + CellIndex(F);
+}
+
+// Cells outside the grid behave like domain walls; unallocated cells read as air (null brick).
+uint GetCellType(int3 C)
+{
+	return InGrid(C) ? CellType[CellIndex(C)] : CELL_SOLID;
+}
+
+uint TypeOf(uint Packed) { return Packed & CELL_TYPE_MASK; }
+uint ColliderOf(uint Packed) { return (Packed >> CELL_COLLIDER_SHIFT) & 0xFFu; }
+
+float3 FacePosition(uint Axis, int3 F)
+{
+	float3 Offset = 0.5 - 0.5 * AxisVector(Axis);
+	return (float3(F) + Offset) * CellSize;
+}
+
+// Smooth relative density of a cell from the P2G weight sums on its six faces (1 = rest density).
+float CellDensity(int3 C)
+{
+	if (!InGrid(C))
+	{
+		return 0.0;
+	}
+	float WeightSum = 0.0;
+	[unroll]
+	for (uint A = 0; A < 3; ++A)
+	{
+		WeightSum += FaceWeight[FaceIndex(A, C)] + FaceWeight[FaceIndex(A, C + AxisOffset(A))];
+	}
+	return WeightSum / (6.0 * TargetParticlesPerCell);
+}
+
+// 1/theta weight of a fluid-air face, from the two cells' densities (1 when ghost fluid is off).
+float AirFaceWeight(float RhoFluid, int3 AirCell)
+{
+	return bGhostFluid != 0u ? 1.0 / GhostTheta(RhoFluid, CellDensity(AirCell)) : 1.0;
+}
+
+float SolidFaceVelocity(uint SolidPacked, uint Axis, float3 P)
+{
+	uint Id = ColliderOf(SolidPacked);
+	if (Id == 0u)
+	{
+		return 0.0;
+	}
+	FSloshCollider C = Colliders[Id - 1u];
+	return dot(ColliderVelocityAt(C, P), AxisVector(Axis));
+}
+
+float ParticleSpacingJitter(uint H)
+{
+	return HashToUnitFloat(H) - 0.5;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Emission: writes EmitCount particles into a ring buffer starting at EmitCursor.
+//   EmitMode 0: stratified fill of a cell box (8 particles per cell, jittered 2x2x2)
+//   EmitMode 1: random points in a sphere (EmitCenter, radius EmitExtent.x)
+//   EmitMode 2: random points in an axis-aligned box (EmitCenter +- EmitExtent)
+// ---------------------------------------------------------------------------------------------
+[numthreads(SLOSH_THREADS, 1, 1)]
+void EmitParticlesCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I = LinearThreadId(DTid, SLOSH_THREADS);
+	if (I >= EmitCount)
+	{
+		return;
+	}
+
+	uint H0 = PcgHash(I * 3u + EmitSeed * 7919u);
+	uint H1 = PcgHash(H0);
+	uint H2 = PcgHash(H1);
+	float3 Rnd = float3(HashToUnitFloat(H0), HashToUnitFloat(H1), HashToUnitFloat(H2));
+
+	float3 P;
+	if (EmitMode == 0u)
+	{
+		uint CellLinear = I / 8u;
+		uint Sub = I % 8u;
+		int3 Local;
+		Local.x = int(CellLinear % uint(EmitCellDims.x));
+		Local.y = int((CellLinear / uint(EmitCellDims.x)) % uint(EmitCellDims.y));
+		Local.z = int(CellLinear / uint(EmitCellDims.x * EmitCellDims.y));
+		float3 SubOffset = float3(Sub & 1u, (Sub >> 1u) & 1u, (Sub >> 2u) & 1u);
+		float3 InCell = (SubOffset + 0.5 + 0.8 * (Rnd - 0.5)) * 0.5;
+		P = (float3(EmitCellMin + Local) + InCell) * CellSize;
+	}
+	else if (EmitMode == 1u)
+	{
+		// Uniform point in sphere via cube-root radius and normalized direction.
+		uint H3 = PcgHash(H2);
+		float CosT = 2.0 * Rnd.x - 1.0;
+		float SinT = sqrt(saturate(1.0 - CosT * CosT));
+		float Phi = 6.28318530718 * Rnd.y;
+		float R = EmitExtent.x * pow(max(HashToUnitFloat(H3), 1e-6), 1.0 / 3.0);
+		P = EmitCenter + R * float3(SinT * cos(Phi), SinT * sin(Phi), CosT);
+	}
+	else
+	{
+		P = EmitCenter + (2.0 * Rnd - 1.0) * EmitExtent;
+	}
+
+	float3 Lo = CellSize * 1.01;
+	float3 Hi = (float3(GridDim) - 1.01) * CellSize;
+
+	FSloshParticle Particle;
+	Particle.Pos = clamp(P, Lo, Hi);
+	Particle.Vel = EmitVelocity;
+	Particle.Cx = 0;
+	Particle.Cy = 0;
+	Particle.Cz = 0;
+	Particle.Age = 0;
+	Particles[(EmitCursor + I) % ParticleCapacity] = PackParticle(Particle);
+	BrickTouch[BrickIndexOf(clamp(int3(floor(Particle.Pos * InvCellSize)), 0, GridDim - 1) >> 3)] = 1u;   // brick pool
+}
+
+// ---------------------------------------------------------------------------------------------
+// Solid classification: domain border cells are walls, cells whose center is inside a collider
+// SDF become solid with that collider's id. Everything else is reset to air (fluid is marked
+// after P2G).
+// ---------------------------------------------------------------------------------------------
+[numthreads(SLOSH_THREADS, 1, 1)]
+void BuildSolidCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint Index;
+	int3 C;
+	if (!SparseCell(LinearThreadId(DTid, SLOSH_THREADS), Index, C))
+	{
+		return;
+	}
+
+	uint Packed = CELL_AIR;
+	if (any(C == 0) || any(C == GridDim - 1))
+	{
+		Packed = CELL_SOLID;
+	}
+	else
+	{
+		float3 P = (float3(C) + 0.5) * CellSize;
+		float Best = 0.0;
+		for (uint K = 0; K < NumColliders; ++K)
+		{
+			float D = ColliderSDF(Colliders[K], P);
+			if (D < Best)
+			{
+				Best = D;
+				Packed = CELL_SOLID | ((K + 1u) << CELL_COLLIDER_SHIFT);
+			}
+		}
+	}
+	CellType[Index] = Packed;
+}
+
+// ---------------------------------------------------------------------------------------------
+// P2G: scatter particle momentum (APIC-augmented when enabled) onto the 8 nearest faces of each
+// MAC component, with fixed-point int atomics. Also counts particles per cell.
+// ---------------------------------------------------------------------------------------------
+void ScatterComponent(uint Axis, float3 Xp, float Up, float3 Cp)
+{
+	float3 Offset = 0.5 - 0.5 * AxisVector(Axis);
+	float3 G = Xp * InvCellSize - Offset;
+	int3 Base = int3(floor(G));
+	float3 Fr = G - float3(Base);
+
+	[unroll]
+	for (uint O = 0; O < 8; ++O)
+	{
+		int3 Oi = int3(O & 1u, (O >> 1u) & 1u, (O >> 2u) & 1u);
+		int3 Node = Base + Oi;
+		if (!InGrid(Node))
+		{
+			continue;
+		}
+		float3 W3 = lerp(1.0 - Fr, Fr, float3(Oi));
+		float W = W3.x * W3.y * W3.z;
+		if (W <= 0.0)
+		{
+			continue;
+		}
+		float3 Xn = (float3(Node) + Offset) * CellSize;
+		float Mom = W * (Up + dot(Cp, Xn - Xp));
+		uint Cell = CellIndex(Node);
+		if (IsNullCell(Cell))
+		{
+			continue;
+		}
+		uint F = Axis * PoolCells + Cell;
+		InterlockedAdd(Accum[F], int(round(Mom * P2G_FIXED_SCALE)));
+		InterlockedAdd(Accum[TotalFaces + F], int(round(W * P2G_FIXED_SCALE)));
+	}
+}
+
+// Tiled P2G. Particles are spatially sorted (SloshSort.usf), so the particles of one thread group
+// usually lie within a few cells. Each group accumulates into a groupshared tile of 8^3 nodes per
+// MAC component (momentum + weight), then flushes one global atomic per touched face instead of 48
+// per particle. Contributions outside the tile fall back to global atomics, so the result is exact
+// (integer sums) whatever the particle order.
+#define P2G_TILE 8
+#define P2G_TILE_NODES (P2G_TILE * P2G_TILE * P2G_TILE)
+#define P2G_TILE_INTS (3 * 2 * P2G_TILE_NODES)
+
+groupshared int TileAccum[P2G_TILE_INTS];
+groupshared int TileOrigin[3];
+
+void ScatterComponentTiled(uint Axis, float3 Xp, float Up, float3 Cp, int3 Origin)
+{
+	float3 Offset = 0.5 - 0.5 * AxisVector(Axis);
+	float3 G = Xp * InvCellSize - Offset;
+	int3 Base = int3(floor(G));
+	float3 Fr = G - float3(Base);
+
+	[unroll]
+	for (uint O = 0; O < 8; ++O)
+	{
+		int3 Oi = int3(O & 1u, (O >> 1u) & 1u, (O >> 2u) & 1u);
+		int3 Node = Base + Oi;
+		if (!InGrid(Node))
+		{
+			continue;
+		}
+		float3 W3 = lerp(1.0 - Fr, Fr, float3(Oi));
+		float W = W3.x * W3.y * W3.z;
+		if (W <= 0.0)
+		{
+			continue;
+		}
+		float3 Xn = (float3(Node) + Offset) * CellSize;
+		int Mom = int(round(W * (Up + dot(Cp, Xn - Xp)) * P2G_FIXED_SCALE));
+		int Wt = int(round(W * P2G_FIXED_SCALE));
+		int3 Local = Node - Origin;
+		if (all(Local >= 0) && all(Local < P2G_TILE))
+		{
+			uint T = (Axis * 2u) * P2G_TILE_NODES + uint(Local.x + P2G_TILE * (Local.y + P2G_TILE * Local.z));
+			InterlockedAdd(TileAccum[T], Mom);
+			InterlockedAdd(TileAccum[T + P2G_TILE_NODES], Wt);
+		}
+		else
+		{
+			uint Cell = CellIndex(Node);
+			if (!IsNullCell(Cell))
+			{
+				uint F = Axis * PoolCells + Cell;
+				InterlockedAdd(Accum[F], Mom);
+				InterlockedAdd(Accum[TotalFaces + F], Wt);
+			}
+		}
+	}
+}
+
+[numthreads(SLOSH_THREADS, 1, 1)]
+void P2GCS(uint3 DTid : SV_DispatchThreadID, uint GroupThread : SV_GroupIndex)
+{
+	[unroll]
+	for (uint K = 0; K < P2G_TILE_INTS / SLOSH_THREADS; ++K)
+	{
+		TileAccum[GroupThread + K * SLOSH_THREADS] = 0;
+	}
+	if (GroupThread < 3)
+	{
+		TileOrigin[GroupThread] = 0x7FFFFFFF;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	uint I = LinearThreadId(DTid, SLOSH_THREADS);
+	bool bValid = I < NumParticles;
+	FSloshParticle P = (FSloshParticle)0;
+	int3 Cell = int3(0, 0, 0);
+	if (bValid)
+	{
+		P = UnpackParticle(Particles[I]);
+		Cell = clamp(int3(floor(P.Pos * InvCellSize)), 0, GridDim - 1);
+		// Stencil nodes span [cell - 1, cell + 1] per axis across the three staggered components.
+		InterlockedMin(TileOrigin[0], Cell.x - 1);
+		InterlockedMin(TileOrigin[1], Cell.y - 1);
+		InterlockedMin(TileOrigin[2], Cell.z - 1);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	const int3 Origin = int3(TileOrigin[0], TileOrigin[1], TileOrigin[2]);
+
+	if (bValid)
+	{
+		float3 Cx = bUseAPIC ? P.Cx : 0;
+		float3 Cy = bUseAPIC ? P.Cy : 0;
+		float3 Cz = bUseAPIC ? P.Cz : 0;
+		ScatterComponentTiled(0, P.Pos, P.Vel.x, Cx, Origin);
+		ScatterComponentTiled(1, P.Pos, P.Vel.y, Cy, Origin);
+		ScatterComponentTiled(2, P.Pos, P.Vel.z, Cz, Origin);
+		uint CountIndex = CellIndex(Cell);
+		if (!IsNullCell(CountIndex))
+		{
+			InterlockedAdd(CellCount[CountIndex], 1);
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// Flush: one global atomic per non-zero tile entry.
+	[unroll]
+	for (uint K2 = 0; K2 < P2G_TILE_INTS / SLOSH_THREADS; ++K2)
+	{
+		uint T = GroupThread + K2 * SLOSH_THREADS;
+		int Value = TileAccum[T];
+		if (Value != 0)
+		{
+			uint Axis = T / (2u * P2G_TILE_NODES);
+			uint Within = T - Axis * 2u * P2G_TILE_NODES;
+			uint bWeight = Within >= P2G_TILE_NODES ? 1u : 0u;
+			uint L = Within - bWeight * P2G_TILE_NODES;
+			int3 Node = Origin + int3(int(L % P2G_TILE), int((L / P2G_TILE) % P2G_TILE), int(L / (P2G_TILE * P2G_TILE)));
+			uint Cell = CellIndex(Node);
+			if (InGrid(Node) && !IsNullCell(Cell))
+			{
+				InterlockedAdd(Accum[bWeight * TotalFaces + Axis * PoolCells + Cell], Value);
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cell marking: non-solid cells containing particles are fluid. Pressure of non-fluid cells is
+// zeroed (free surface p = 0); fluid cells keep a rescaled warm start.
+// ---------------------------------------------------------------------------------------------
+[numthreads(SLOSH_THREADS, 1, 1)]
+void MarkCellsCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint Index;
+	int3 C;
+	if (!SparseCell(LinearThreadId(DTid, SLOSH_THREADS), Index, C))
+	{
+		return;
+	}
+	uint Packed = CellType[Index];
+	if (TypeOf(Packed) != CELL_SOLID)
+	{
+		int Count = CellCount[Index];
+		Packed = Count > 0 ? CELL_FLUID : CELL_AIR;
+		if (float(Count) >= 0.5 * TargetParticlesPerCell)
+		{
+			Packed |= CELL_DENSE_FLAG;
+		}
+		CellType[Index] = Packed;
+	}
+	if (TypeOf(Packed) == CELL_FLUID)
+	{
+		Pressure[Index] *= WarmStartScale;
+		InterlockedAdd(Stats[1], 1u);
+	}
+	else
+	{
+		Pressure[Index] = 0.0;
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Normalize P2G, store the FLIP reference velocity, add gravity, enforce solid velocities.
+// Also clears the accumulators for the next substep.
+// ---------------------------------------------------------------------------------------------
+void NormalizeFace(uint F, uint Axis, int3 Fc)
+{
+
+	int Mom = Accum[F];
+	int Wt = Accum[TotalFaces + F];
+	// Most faces of a large domain are empty air: skip clearing what P2G never touched.
+	if (Mom != 0 || Wt != 0)
+	{
+		Accum[F] = 0;
+		Accum[TotalFaces + F] = 0;
+	}
+
+	float U = Wt > 0 ? float(Mom) / float(Wt) : 0.0;
+	FaceWeight[F] = float(Wt) * P2G_FIXED_INV;
+	uint Flags = Wt > 0 ? FACE_HAS_WEIGHT : 0u;
+	if (bUseAPIC == 0u)
+	{
+		VelOld[F] = U;   // FLIP reference; never read in APIC mode
+	}
+
+	uint A = GetCellType(Fc - AxisOffset(Axis));
+	uint B = GetCellType(Fc);
+	if (TypeOf(A) == CELL_SOLID && TypeOf(B) == CELL_SOLID)
+	{
+		// Interior of a solid: no boundary condition here. Leave it invalid so extrapolation fills it
+		// from the fluid side; otherwise particles beside a moving body would inherit its tangential
+		// velocity (spurious no-slip that drags liquid along with the body).
+		uint SolidPacked = TypeOf(B) == CELL_SOLID ? B : A;
+		U = SolidFaceVelocity(SolidPacked, Axis, FacePosition(Axis, Fc));
+	}
+	else if (TypeOf(A) == CELL_SOLID || TypeOf(B) == CELL_SOLID)
+	{
+		uint SolidPacked = TypeOf(B) == CELL_SOLID ? B : A;
+		U = SolidFaceVelocity(SolidPacked, Axis, FacePosition(Axis, Fc));
+		Flags |= FACE_VALID | FACE_SOLID;
+	}
+	else if (TypeOf(A) == CELL_FLUID || TypeOf(B) == CELL_FLUID)
+	{
+		U += Gravity[Axis] * Dt;
+		Flags |= FACE_VALID;
+	}
+	else
+	{
+		U = 0.0;
+	}
+	Vel[F] = U;
+	FaceFlags[F] = Flags;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Implicit viscosity, one Jacobi iteration of (I - nu*dt*Laplacian) u = u*.
+// Vel holds u*, VelSrc the current iterate, VelDst receives the next iterate.
+// ---------------------------------------------------------------------------------------------
+void ViscosityJacobiFace(uint F, uint Axis, int3 Fc)
+{
+	uint Flags = FaceFlags[F];
+	float Center = VelSrc[F];
+	if ((Flags & FACE_VALID) == 0u || (Flags & FACE_SOLID) != 0u)
+	{
+		VelDst[F] = Center;
+		return;
+	}
+
+	float Sum = 0.0;
+	[unroll]
+	for (uint N = 0; N < 6; ++N)
+	{
+		int3 D = int3(0, 0, 0);
+		D[N >> 1u] = (N & 1u) ? 1 : -1;
+		int3 Nb = Fc + D;
+		float Value = Center;
+		if (InGrid(Nb))
+		{
+			uint NbIndex = FaceIndex(Axis, Nb);
+			if ((FaceFlags[NbIndex] & FACE_VALID) != 0u)
+			{
+				Value = VelSrc[NbIndex];
+			}
+		}
+		Sum += Value;
+	}
+	VelDst[F] = (Vel[F] + ViscosityAlpha * Sum) / (1.0 + 6.0 * ViscosityAlpha);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Divergence of fluid cells, with an optional density correction term that pushes apart cells
+// holding more particles than the rest density (counters FLIP volume drift). Clears CellCount.
+// ---------------------------------------------------------------------------------------------
+[numthreads(SLOSH_THREADS, 1, 1)]
+void DivergenceCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint Index;
+	int3 C;
+	if (!SparseCell(LinearThreadId(DTid, SLOSH_THREADS), Index, C))
+	{
+		return;
+	}
+	CellCount[Index] = 0;
+
+	if (TypeOf(CellType[Index]) != CELL_FLUID)
+	{
+		Divergence[Index] = 0.0;
+		CellDiag[Index] = 0.0;
+		return;
+	}
+	float Div = 0.0;
+	[unroll]
+	for (uint Axis = 0; Axis < 3; ++Axis)
+	{
+		Div += Vel[FaceIndex(Axis, C + AxisOffset(Axis))] - Vel[FaceIndex(Axis, C)];
+	}
+	// Smooth density from the trilinear P2G weight sums on the cell's six faces (rest value = particles per
+	// cell). The integer particle count flickers as particles cross cell boundaries, which made the
+	// correction inject frame-to-frame pressure noise (+12-17% buoyancy bias, ~3x force jitter; measured).
+	float WeightSum = 0.0;
+	[unroll]
+	for (uint A2 = 0; A2 < 3; ++A2)
+	{
+		WeightSum += FaceWeight[FaceIndex(A2, C)] + FaceWeight[FaceIndex(A2, C + AxisOffset(A2))];
+	}
+	float Rho = WeightSum / (6.0 * TargetParticlesPerCell);
+	float Excess = max(Rho - (1.0 + DensityDeadband), 0.0);
+	float Target = min(DensityCorrection * Excess, 0.5) * CellSize / Dt;
+	Divergence[Index] = Div - Target;
+
+	// Operator diagonal: non-solid neighbours count 1, air neighbours 1/theta (ghost fluid).
+	float Diag = 0.0;
+	[unroll]
+	for (uint N = 0; N < 6; ++N)
+	{
+		int3 D = int3(0, 0, 0);
+		D[N >> 1u] = (N & 1u) ? 1 : -1;
+		int3 Nb = C + D;
+		uint NbType = TypeOf(GetCellType(Nb));
+		Diag += NbType == CELL_FLUID ? 1.0 : (NbType == CELL_AIR ? AirFaceWeight(Rho, Nb) : 0.0);
+	}
+	CellDiag[Index] = Diag;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Two-sided density projection (after Kugelstadt et al. 2019, "Implicit density projection for volume
+// conserving liquids"). Solve A q = s * (rho - 1) with the pressure operator (ghost-fluid diagonal), then shift
+// particle *positions* by the face displacements -(q_b - q_a) * h. Unlike the velocity-based correction this
+// both expands over-dense and contracts under-dense liquid, and injects no momentum.
+//   - Density skips faces shared with solids (their P2G weight only comes from one side).
+//   - Cells touching air may only expand: a partly filled surface cell reads low without being under-dense.
+// This kernel is dispatched with Divergence := rhs and Pressure := q, so PressureRBGSCS / MGPCG solve it as-is
+// (they solve N q - sum(q_n) = -rhs).
+// ---------------------------------------------------------------------------------------------
+float CellDensityInterior(int3 C)
+{
+	float WeightSum = 0.0;
+	float Faces = 0.0;
+	[unroll]
+	for (uint A = 0; A < 3; ++A)
+	{
+		int3 E = AxisOffset(A);
+		if (TypeOf(GetCellType(C - E)) != CELL_SOLID)
+		{
+			WeightSum += FaceWeight[FaceIndex(A, C)];
+			Faces += 1.0;
+		}
+		if (TypeOf(GetCellType(C + E)) != CELL_SOLID)
+		{
+			WeightSum += FaceWeight[FaceIndex(A, C + E)];
+			Faces += 1.0;
+		}
+	}
+	return Faces > 0.0 ? WeightSum / (Faces * TargetParticlesPerCell) : 1.0;
+}
+
+[numthreads(SLOSH_THREADS, 1, 1)]
+void DensityProjectionRhsCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint Index;
+	int3 C;
+	if (!SparseCell(LinearThreadId(DTid, SLOSH_THREADS), Index, C))
+	{
+		return;
+	}
+	Pressure[Index] = 0.0;   // q starts from zero each frame
+	if (TypeOf(CellType[Index]) != CELL_FLUID)
+	{
+		Divergence[Index] = 0.0;
+		return;
+	}
+	float Deviation = CellDensityInterior(C) - 1.0;
+	bool bTouchesAir = false;
+	[unroll]
+	for (uint N = 0; N < 6; ++N)
+	{
+		int3 D = int3(0, 0, 0);
+		D[N >> 1u] = (N & 1u) ? 1 : -1;
+		bTouchesAir = bTouchesAir || TypeOf(GetCellType(C + D)) == CELL_AIR;
+	}
+	if (bTouchesAir)
+	{
+		Deviation = max(Deviation, 0.0);
+	}
+	// Target displacement divergence (in cells): positive spreads particles apart.
+	Divergence[Index] = -DensityRelaxation * clamp(Deviation, -0.5, 0.5);
+}
+
+// Face displacement (in cells) of the density projection; zero on faces touching a solid.
+float DensityFaceDisplacement(uint Axis, int3 F)
+{
+	int3 Ca = F - AxisOffset(Axis);
+	uint A = GetCellType(Ca);
+	uint B = GetCellType(F);
+	if (TypeOf(A) == CELL_SOLID || TypeOf(B) == CELL_SOLID)
+	{
+		return 0.0;
+	}
+	float Qa = TypeOf(A) == CELL_FLUID ? DensityQ[CellIndex(Ca)] : 0.0;
+	float Qb = TypeOf(B) == CELL_FLUID ? DensityQ[CellIndex(F)] : 0.0;
+	return -(Qb - Qa);
+}
+
+// Face displacements of the density projection, written into the spare velocity buffer (VelDst) before G2P so the
+// particle gather reads one value per stencil node instead of two cell types and two potentials (measured: the
+// per-particle evaluation added ~2.7 ms to G2P at 9.8M particles).
+void DensityDisplacementFace(uint F, uint Axis, int3 Fc)
+{
+	VelDst[F] = DensityFaceDisplacement(Axis, Fc);
+}
+
+float3 SampleDensityDisplacement(float3 Xp)
+{
+	float3 Disp;
+	[unroll]
+	for (uint Axis = 0; Axis < 3; ++Axis)
+	{
+		float3 Offset = 0.5 - 0.5 * AxisVector(Axis);
+		float3 G = Xp * InvCellSize - Offset;
+		int3 Base = int3(floor(G));
+		float3 Fr = G - float3(Base);
+		float Value = 0.0;
+		[unroll]
+		for (uint O = 0; O < 8; ++O)
+		{
+			int3 Oi = int3(O & 1u, (O >> 1u) & 1u, (O >> 2u) & 1u);
+			int3 Node = clamp(Base + Oi, 0, GridDim - 1);
+			float3 W3 = lerp(1.0 - Fr, Fr, float3(Oi));
+			Value += W3.x * W3.y * W3.z * VelDst[FaceIndex(Axis, Node)];   // DensityDisplacementCS
+		}
+		Disp[Axis] = Value;
+	}
+	// At most half a cell per frame keeps the shift a gentle correction.
+	float Len = length(Disp);
+	return (Len > 0.5 ? Disp * (0.5 / Len) : Disp) * CellSize;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pressure: red-black SOR on N*p_c - sum(p_n) = -div, solid neighbours excluded (Neumann),
+// air neighbours p = 0 (Dirichlet free surface).
+// ---------------------------------------------------------------------------------------------
+[numthreads(SLOSH_THREADS, 1, 1)]
+void PressureRBGSCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint Index;
+	int3 C;
+	if (!SparseCell(LinearThreadId(DTid, SLOSH_THREADS), Index, C) || TypeOf(CellType[Index]) != CELL_FLUID)
+	{
+		return;
+	}
+	if (((uint(C.x + C.y + C.z)) & 1u) != Parity)
+	{
+		return;
+	}
+	float Sum = 0.0;
+	float Diag = CellDiag[Index];
+	[unroll]
+	for (uint N = 0; N < 6; ++N)
+	{
+		int3 D = int3(0, 0, 0);
+		D[N >> 1u] = (N & 1u) ? 1 : -1;
+		int3 Nb = C + D;
+		if (TypeOf(GetCellType(Nb)) == CELL_FLUID)
+		{
+			Sum += Pressure[CellIndex(Nb)];
+		}
+	}
+	if (Diag > 0.0)
+	{
+		float Gs = (Sum - Divergence[Index]) / Diag;
+		float Old = Pressure[Index];
+		Pressure[Index] = Old + SORWeight * (Gs - Old);
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Projection: subtract the pressure gradient, keep solid faces at the solid velocity, and
+// accumulate pressure force/torque plus wetted-surface statistics on two-way colliders.
+// ---------------------------------------------------------------------------------------------
+float3 CellCenterVelocity(int3 C)
+{
+	float3 V;
+	[unroll]
+	for (uint Axis = 0; Axis < 3; ++Axis)
+	{
+		V[Axis] = 0.5 * (Vel[FaceIndex(Axis, C)] + Vel[FaceIndex(Axis, C + AxisOffset(Axis))]);
+	}
+	return V;
+}
+
+bool IsTwoWayCollider(uint ColliderId)
+{
+	return (Colliders[ColliderId].Flags & COLLIDER_FLAG_TWO_WAY) != 0u;
+}
+
+void AccumulatePressureForce(uint ColliderId, float3 FacePos, float3 IntoSolid, float PressureHat)
+{
+	float PressurePa = PressureHat * PressureToPascal;
+	float3 Force = PressurePa * CellSize * CellSize * IntoSolid;
+	float3 Torque = cross(FacePos - Colliders[ColliderId].Center, Force);
+	uint Base = ColliderId * COUPLING_STRIDE;
+	InterlockedAdd(Coupling[Base + 0], int(round(Force.x * CouplingScale)));
+	InterlockedAdd(Coupling[Base + 1], int(round(Force.y * CouplingScale)));
+	InterlockedAdd(Coupling[Base + 2], int(round(Force.z * CouplingScale)));
+	InterlockedAdd(Coupling[Base + 3], int(round(Torque.x * CouplingScale)));
+	InterlockedAdd(Coupling[Base + 4], int(round(Torque.y * CouplingScale)));
+	InterlockedAdd(Coupling[Base + 5], int(round(Torque.z * CouplingScale)));
+}
+
+// Fluid-solid face of a two-way collider: wetted-surface statistics (drag inputs), plus the binary
+// face pressure force when the smoothed estimator (CouplingForceCS) is disabled.
+void AccumulateCoupling(uint ColliderId, int3 FluidCell, float3 FacePos, float3 IntoSolid, float PressureHat)
+{
+	if (!IsTwoWayCollider(ColliderId))
+	{
+		return;
+	}
+	if (bSmoothCoupling == 0u)
+	{
+		AccumulatePressureForce(ColliderId, FacePos, IntoSolid, PressureHat);
+	}
+	float3 FluidVel = CellCenterVelocity(FluidCell);
+	uint Base = ColliderId * COUPLING_STRIDE;
+	InterlockedAdd(Coupling[Base + 6], 1);
+	InterlockedAdd(Coupling[Base + 8], int(round(FluidVel.x * CouplingScale)));
+	InterlockedAdd(Coupling[Base + 9], int(round(FluidVel.y * CouplingScale)));
+	InterlockedAdd(Coupling[Base + 10], int(round(FluidVel.z * CouplingScale)));
+}
+
+// Seepage pressure for a contact face between collider Id and another solid (domain wall or another
+// body). Binary cells leave no liquid layer in the gap, so the face would otherwise feel no pressure and a
+// body resting on the floor would get no lift. Assume liquid seeps into the contact: use the pressure of
+// the liquid surrounding the body at the same height, found by walking horizontally out of the body.
+// Returns false when no liquid is found (dry contact: no force).
+bool EstimateSeepagePressure(int3 BodyCell, uint Id, out float PressureHat)
+{
+	const int3 Dirs[4] = { int3(1, 0, 0), int3(-1, 0, 0), int3(0, 1, 0), int3(0, -1, 0) };
+	float Sum = 0.0;
+	float Count = 0.0;
+	[unroll]
+	for (uint DirIndex = 0; DirIndex < 4; ++DirIndex)
+	{
+		int3 P = BodyCell;
+		for (uint Step = 0; Step < 16; ++Step)
+		{
+			P += Dirs[DirIndex];
+			uint T = GetCellType(P);
+			if (TypeOf(T) != CELL_SOLID || ColliderOf(T) != Id)
+			{
+				if (TypeOf(T) == CELL_FLUID)
+				{
+					Sum += Pressure[CellIndex(P)];
+					Count += 1.0;
+				}
+				break;
+			}
+		}
+	}
+	PressureHat = Count > 0.0 ? Sum / Count : 0.0;
+	return Count > 0.0;
+}
+
+void AccumulateContact(uint SolidPacked, int3 BodyCell, float3 FacePos, float3 IntoBody)
+{
+	uint Id = ColliderOf(SolidPacked);
+	if (Id == 0u || !IsTwoWayCollider(Id - 1u))
+	{
+		return;
+	}
+	float PressureHat;
+	if (EstimateSeepagePressure(BodyCell, Id, PressureHat))
+	{
+		AccumulatePressureForce(Id - 1u, FacePos, IntoBody, PressureHat);
+	}
+}
+
+void ProjectFace(uint F, uint Axis, int3 Fc)
+{
+	int3 Ca = Fc - AxisOffset(Axis);
+	int3 Cb = Fc;
+	uint A = GetCellType(Ca);
+	uint B = GetCellType(Cb);
+	uint Flags = FaceFlags[F] & (FACE_HAS_WEIGHT);
+
+	if (TypeOf(A) == CELL_SOLID && TypeOf(B) == CELL_SOLID)
+	{
+		// Solid interior: left for extrapolation (see NormalizeFacesCS). Faces between two *different*
+		// solids are contacts and receive seepage pressure (see EstimateSeepagePressure).
+		if (NumColliders > 0 && ColliderOf(A) != ColliderOf(B))
+		{
+			float3 FacePos = FacePosition(Axis, Fc);
+			AccumulateContact(B, Cb, FacePos, AxisVector(Axis));
+			AccumulateContact(A, Ca, FacePos, -AxisVector(Axis));
+		}
+	}
+	else if (TypeOf(A) == CELL_SOLID || TypeOf(B) == CELL_SOLID)
+	{
+		Flags |= FACE_VALID | FACE_SOLID;
+		if (NumColliders > 0)
+		{
+			if (TypeOf(A) == CELL_FLUID && ColliderOf(B) != 0u)
+			{
+				AccumulateCoupling(ColliderOf(B) - 1u, Ca, FacePosition(Axis, Fc), AxisVector(Axis), Pressure[CellIndex(Ca)]);
+			}
+			else if (TypeOf(B) == CELL_FLUID && ColliderOf(A) != 0u)
+			{
+				AccumulateCoupling(ColliderOf(A) - 1u, Cb, FacePosition(Axis, Fc), -AxisVector(Axis), Pressure[CellIndex(Cb)]);
+			}
+		}
+	}
+	else if (TypeOf(A) == CELL_FLUID || TypeOf(B) == CELL_FLUID)
+	{
+		float Pa, Pb;
+		if (TypeOf(A) == CELL_FLUID && TypeOf(B) == CELL_FLUID)
+		{
+			Pa = Pressure[CellIndex(Ca)];
+			Pb = Pressure[CellIndex(Cb)];
+		}
+		else if (TypeOf(A) == CELL_FLUID)
+		{
+			// Ghost pressure in the air cell so that p = 0 at the interface: gradient = -p_a / theta.
+			Pa = Pressure[CellIndex(Ca)];
+			Pb = Pa - Pa * AirFaceWeight(CellDensity(Ca), Cb);
+		}
+		else
+		{
+			Pb = Pressure[CellIndex(Cb)];
+			Pa = Pb - Pb * AirFaceWeight(CellDensity(Cb), Ca);
+		}
+		Vel[F] -= (Pb - Pa);
+		Flags |= FACE_VALID;
+	}
+	FaceFlags[F] = Flags;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Smoothed pressure force on two-way colliders. Each cell near a body contributes
+//     F += -p * h^2 * sum_faces( w_f * n_f ),   w_f = saturate(0.5 + phi(x_f) / h)
+// i.e. the closed-surface identity (fluid faces + solid interface = 0) with fluid face fractions taken
+// from the body's SDF instead of binary cell flags, so the force varies continuously as the body moves
+// through the grid (no staircase jitter). The body's own surface cells use their fluid neighbours'
+// pressure. Faces shared with another solid (floor, walls, other bodies) are excluded here and handled
+// by the binary seepage contact rule in ProjectCS, which also covers bodies extending through the
+// domain walls. Cells with |phi| > h contribute exactly zero.
+// ---------------------------------------------------------------------------------------------
+// Pressure of the fluid 6-neighbours of a cell (used for the body's own surface cells).
+bool FluidNeighbourPressure(int3 C, out float PressureHat)
+{
+	float Sum = 0.0;
+	float Count = 0.0;
+	[unroll]
+	for (uint N = 0; N < 6; ++N)
+	{
+		int3 D = int3(0, 0, 0);
+		D[N >> 1u] = (N & 1u) ? 1 : -1;
+		int3 Nb = C + D;
+		if (TypeOf(GetCellType(Nb)) == CELL_FLUID)
+		{
+			Sum += Pressure[CellIndex(Nb)];
+			Count += 1.0;
+		}
+	}
+	PressureHat = Count > 0.0 ? Sum / Count : 0.0;
+	return Count > 0.0;
+}
+
+// Pressure gradient (per meter, p_hat units) at a fluid cell from fluid neighbours: central difference where
+// both sides are fluid, one-sided otherwise. Used to move cell-centre pressure onto the body surface; reading
+// it at the cell centre, half a cell outside the body, inflated the hydrostatic force by (H + h) / H.
+float3 FluidPressureGradient(int3 C, float Pc)
+{
+	float3 G = 0.0;
+	[unroll]
+	for (uint A = 0; A < 3; ++A)
+	{
+		int3 E = AxisOffset(A);
+		bool bPlus = TypeOf(GetCellType(C + E)) == CELL_FLUID;
+		bool bMinus = TypeOf(GetCellType(C - E)) == CELL_FLUID;
+		float Pp = bPlus ? Pressure[CellIndex(C + E)] : 0.0;
+		float Pm = bMinus ? Pressure[CellIndex(C - E)] : 0.0;
+		G[A] = bPlus && bMinus ? (Pp - Pm) * 0.5 : (bPlus ? Pp - Pc : (bMinus ? Pc - Pm : 0.0));
+	}
+	return G * InvCellSize;
+}
+
+// Surface pressure for a body's own surface cell: from each fluid neighbour, extrapolate linearly (using the
+// next cell outward) to the shared face, then average.
+bool BodySurfacePressure(int3 C, out float PressureHat)
+{
+	float Sum = 0.0;
+	float Count = 0.0;
+	[unroll]
+	for (uint N = 0; N < 6; ++N)
+	{
+		int3 D = int3(0, 0, 0);
+		D[N >> 1u] = (N & 1u) ? 1 : -1;
+		int3 Nb = C + D;
+		if (TypeOf(GetCellType(Nb)) == CELL_FLUID)
+		{
+			float Pn = Pressure[CellIndex(Nb)];
+			float Slope = TypeOf(GetCellType(Nb + D)) == CELL_FLUID ? Pressure[CellIndex(Nb + D)] - Pn : 0.0;
+			Sum += Pn - 0.5 * Slope;
+			Count += 1.0;
+		}
+	}
+	PressureHat = Count > 0.0 ? Sum / Count : 0.0;
+	return Count > 0.0;
+}
+
+[numthreads(SLOSH_THREADS, 1, 1)]
+void CouplingForceCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint Index;
+	int3 C;
+	if (!SparseCell(LinearThreadId(DTid, SLOSH_THREADS), Index, C))
+	{
+		return;
+	}
+	uint Packed = CellType[Index];
+	uint Type = TypeOf(Packed);
+	if (Type == CELL_AIR)
+	{
+		return;
+	}
+	float3 X = (float3(C) + 0.5) * CellSize;
+
+	// Fluid cells use their own pressure; a body's own surface cells use their fluid neighbours'.
+	// Other solids (walls, other bodies) are left to the binary seepage contact rule in ProjectCS.
+	float PressureHat = 0.0;
+	float3 Gradient = 0.0;
+	bool bHavePressure = false;
+	if (Type == CELL_FLUID)
+	{
+		PressureHat = Pressure[Index];
+		Gradient = FluidPressureGradient(C, PressureHat);
+		bHavePressure = true;
+	}
+	else if (ColliderOf(Packed) != 0u)
+	{
+		bHavePressure = BodySurfacePressure(C, PressureHat);
+	}
+	if (!bHavePressure)
+	{
+		return;
+	}
+
+	for (uint K = 0; K < NumColliders; ++K)
+	{
+		FSloshCollider Col = Colliders[K];
+		if ((Col.Flags & COLLIDER_FLAG_TWO_WAY) == 0u || abs(ColliderSDF(Col, X)) > CellSize)
+		{
+			continue;
+		}
+		if (Type == CELL_SOLID && ColliderOf(Packed) != K + 1u)
+		{
+			continue;   // inside a different body
+		}
+		// Evaluate the pressure on the body surface: fluid cells move along -phi * n to the closest surface
+		// point; body cells already hold a face-extrapolated value.
+		float SurfacePressure = PressureHat;
+		if (Type == CELL_FLUID)
+		{
+			float Phi = ColliderSDF(Col, X);
+			SurfacePressure += dot(Gradient, -Phi * ColliderNormal(Col, X, 0.25 * CellSize));
+		}
+		float Scale = -SurfacePressure * PressureToPascal * CellSize * CellSize;
+		float3 Force = 0.0;
+		float3 Torque = 0.0;
+		[unroll]
+		for (uint N = 0; N < 6; ++N)
+		{
+			float3 Normal = 0.0;
+			Normal[N >> 1u] = (N & 1u) ? 1.0 : -1.0;
+			float3 FacePos = X + 0.5 * CellSize * Normal;
+			// A body cell's faces shared with another solid are handled by the contact rule; skip them
+			// here. (Fluid cells keep every face: their closed-surface sum must stay complete.)
+			if (Type == CELL_SOLID)
+			{
+				uint NbPacked = GetCellType(C + int3(Normal));
+				if (TypeOf(NbPacked) == CELL_SOLID && ColliderOf(NbPacked) != K + 1u)
+				{
+					continue;
+				}
+			}
+			float W = saturate(0.5 + ColliderSDF(Col, FacePos) * InvCellSize);
+			float3 DF = Scale * W * Normal;
+			Force += DF;
+			Torque += cross(FacePos - Col.Center, DF);
+		}
+		uint Base = K * COUPLING_STRIDE;
+		InterlockedAdd(Coupling[Base + 0], int(round(Force.x * CouplingScale)));
+		InterlockedAdd(Coupling[Base + 1], int(round(Force.y * CouplingScale)));
+		InterlockedAdd(Coupling[Base + 2], int(round(Force.z * CouplingScale)));
+		InterlockedAdd(Coupling[Base + 3], int(round(Torque.x * CouplingScale)));
+		InterlockedAdd(Coupling[Base + 4], int(round(Torque.y * CouplingScale)));
+		InterlockedAdd(Coupling[Base + 5], int(round(Torque.z * CouplingScale)));
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Diagnostics: divergence of the projected field in fluid cells (1/s). Stats[2] = max (float bits),
+// Stats[3] = sum in 1e-3 units, Stats[4] = sampled fluid cells.
+// ---------------------------------------------------------------------------------------------
+[numthreads(SLOSH_THREADS, 1, 1)]
+void ResidualCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint Index;
+	int3 C;
+	if (!SparseCell(LinearThreadId(DTid, SLOSH_THREADS), Index, C) || TypeOf(CellType[Index]) != CELL_FLUID)
+	{
+		return;
+	}
+	float Div = 0.0;
+	[unroll]
+	for (uint Axis = 0; Axis < 3; ++Axis)
+	{
+		Div += Vel[FaceIndex(Axis, C + AxisOffset(Axis))] - Vel[FaceIndex(Axis, C)];
+	}
+	float Rate = abs(Div) * InvCellSize;
+	InterlockedMax(Stats[2], asuint(Rate));
+	InterlockedAdd(Stats[3], uint(min(Rate, 1.0e5) * 1000.0));
+	InterlockedAdd(Stats[4], 1u);
+
+	// Mean relative density of interior liquid (cells not touching air): the compression / volume-drift metric.
+	bool bTouchesAir = false;
+	[unroll]
+	for (uint N = 0; N < 6; ++N)
+	{
+		int3 D = int3(0, 0, 0);
+		D[N >> 1u] = (N & 1u) ? 1 : -1;
+		bTouchesAir = bTouchesAir || TypeOf(GetCellType(C + D)) == CELL_AIR;
+	}
+	if (!bTouchesAir)
+	{
+		// Signed deviation from rest density (1e-4 units): an absolute sum overflowed 32 bits beyond ~0.4M cells.
+		InterlockedAdd(Stats[5], asuint(int(round((clamp(CellDensityInterior(C), 0.0, 4.0) - 1.0) * 10000.0))));
+		InterlockedAdd(Stats[6], 1u);
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Velocity extrapolation into the air band: invalid faces take the average of valid neighbours.
+// Iteration n only trusts flags set before it, so the result is deterministic.
+// ---------------------------------------------------------------------------------------------
+void ExtrapolateFace(uint F, uint Axis, int3 Fc)
+{
+	uint KnownMask = FACE_VALID;
+	for (uint It = 0; It < ExtrapIteration; ++It)
+	{
+		KnownMask |= 1u << (FACE_EXTRAP_SHIFT + It);
+	}
+
+	uint Flags = FaceFlags[F];
+	float Center = VelSrc[F];
+	if ((Flags & KnownMask) != 0u)
+	{
+		VelDst[F] = Center;
+		return;
+	}
+
+	float Sum = 0.0;
+	float Count = 0.0;
+	[unroll]
+	for (uint N = 0; N < 6; ++N)
+	{
+		int3 D = int3(0, 0, 0);
+		D[N >> 1u] = (N & 1u) ? 1 : -1;
+		int3 Nb = Fc + D;
+		if (InGrid(Nb))
+		{
+			uint NbIndex = FaceIndex(Axis, Nb);
+			uint NbFlags = FaceFlags[NbIndex];
+			// Seed only from fluid-carried velocities. Solid boundary faces hold the body's normal
+			// velocity; spreading it into the solid interior would leak tangential body motion into
+			// adjacent particles through the G2P stencil.
+			if ((NbFlags & KnownMask) != 0u && (NbFlags & FACE_SOLID) == 0u)
+			{
+				Sum += VelSrc[NbIndex];
+				Count += 1.0;
+			}
+		}
+	}
+	if (Count > 0.0)
+	{
+		VelDst[F] = Sum / Count;
+		InterlockedOr(FaceFlags[F], 1u << (FACE_EXTRAP_SHIFT + ExtrapIteration));
+	}
+	else
+	{
+		VelDst[F] = 0.0;
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Submerged-volume estimate per collider (once per frame). A solid cell of collider k counts as
+// submerged when a short horizontal walk out of the solid region first reaches fluid.
+// ---------------------------------------------------------------------------------------------
+[numthreads(SLOSH_THREADS, 1, 1)]
+void SubmergedCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint Index;
+	int3 C;
+	if (!SparseCell(LinearThreadId(DTid, SLOSH_THREADS), Index, C))
+	{
+		return;
+	}
+	uint Packed = CellType[Index];
+	uint Id = ColliderOf(Packed);
+	if (TypeOf(Packed) != CELL_SOLID || Id == 0u)
+	{
+		return;
+	}
+	uint Base = (Id - 1u) * COUPLING_STRIDE;
+	InterlockedAdd(Coupling[Base + 11], 1);
+
+	// Horizontal walks only: an upward walk would count liquid resting on top of the body as
+	// submersion (positive feedback: buoyancy lifts the puddle, the puddle keeps the body "submerged").
+	const int3 Dirs[4] = { int3(1, 0, 0), int3(-1, 0, 0), int3(0, 1, 0), int3(0, -1, 0) };
+	bool bSubmerged = false;
+	[unroll]
+	for (uint DirIndex = 0; DirIndex < 4; ++DirIndex)
+	{
+		int3 P = C;
+		for (uint Step = 0; Step < 12; ++Step)
+		{
+			P += Dirs[DirIndex];
+			uint T = GetCellType(P);
+			if (TypeOf(T) != CELL_SOLID || ColliderOf(T) != Id)
+			{
+				// Only dense, supported liquid counts: thin sheets and airborne lumps flung off a fast
+				// body must not buoy it. Supported = no air in the three cells below the exit cell.
+				bool bLiquid = TypeOf(T) == CELL_FLUID && (T & CELL_DENSE_FLAG) != 0u;
+				[unroll]
+				for (int Below = 1; Below <= 3; ++Below)
+				{
+					bLiquid = bLiquid && TypeOf(GetCellType(P - int3(0, 0, Below))) != CELL_AIR;
+				}
+				bSubmerged = bSubmerged || bLiquid;
+				break;
+			}
+		}
+	}
+	if (bSubmerged)
+	{
+		// Centroid offset relative to the collider center (small values keep fixed point precise).
+		float3 Offset = (float3(C) + 0.5) * CellSize - Colliders[Id - 1u].Center;
+		InterlockedAdd(Coupling[Base + 7], 1);
+		InterlockedAdd(Coupling[Base + 12], int(round(Offset.x * CouplingScale)));
+		InterlockedAdd(Coupling[Base + 13], int(round(Offset.y * CouplingScale)));
+		InterlockedAdd(Coupling[Base + 14], int(round(Offset.z * CouplingScale)));
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// G2P + advection: PIC/FLIP blend or APIC transfer, RK2 advection through the divergence-free
+// field, collider and domain collision response.
+// ---------------------------------------------------------------------------------------------
+void GatherComponent(uint Axis, float3 Xp, out float UNew, out float DeltaSum, out float DeltaWeight, out float3 Grad)
+{
+	float3 Offset = 0.5 - 0.5 * AxisVector(Axis);
+	float3 G = Xp * InvCellSize - Offset;
+	int3 Base = int3(floor(G));
+	float3 Fr = G - float3(Base);
+	UNew = 0.0;
+	DeltaSum = 0.0;
+	DeltaWeight = 0.0;
+	Grad = 0.0;
+
+	[unroll]
+	for (uint O = 0; O < 8; ++O)
+	{
+		int3 Oi = int3(O & 1u, (O >> 1u) & 1u, (O >> 2u) & 1u);
+		int3 Node = clamp(Base + Oi, 0, GridDim - 1);
+		float3 W3 = lerp(1.0 - Fr, Fr, float3(Oi));
+		float W = W3.x * W3.y * W3.z;
+		float3 Sign = float3(Oi) * 2.0 - 1.0;
+		float3 GradW = Sign * float3(W3.y * W3.z, W3.x * W3.z, W3.x * W3.y) * InvCellSize;
+		uint F = FaceIndex(Axis, Node);
+		float U = Vel[F];
+		UNew += W * U;
+		if (bUseAPIC != 0u)
+		{
+			Grad += GradW * U;
+		}
+		// The FLIP delta needs VelOld and FaceFlags: two thirds of the gather traffic, skipped in APIC mode.
+		else if ((FaceFlags[F] & FACE_HAS_WEIGHT) != 0u)
+		{
+			DeltaSum += W * (U - VelOld[F]);
+			DeltaWeight += W;
+		}
+	}
+}
+
+// Velocity at Xp for advection. Faces outside the known band (not fluid-carried, solid or extrapolated) hold no
+// velocity, only the zero default: those stencil nodes take Fallback (the particle's own velocity) instead. Without
+// this, a fast droplet whose RK2 midpoint lands past the extrapolation band (0.5 dt |v| > 2 cells, e.g. 20 m/s at
+// 1.25 cm cells and 4 substeps) samples zero, stops moving, keeps its velocity and is accelerated by gravity up to
+// MaxSpeed for good, which pins the substep count at its maximum (R-21).
+float SampleVelocityComponent(uint Axis, float3 Xp, float Fallback, bool bCheckKnown)
+{
+	const uint KnownMask = FACE_VALID | (0xFFFFFFFFu << FACE_EXTRAP_SHIFT);   // valid or filled by any extrapolation layer
+	float3 Offset = 0.5 - 0.5 * AxisVector(Axis);
+	float3 G = Xp * InvCellSize - Offset;
+	int3 Base = int3(floor(G));
+	float3 Fr = G - float3(Base);
+	float U = 0.0;
+	[unroll]
+	for (uint O = 0; O < 8; ++O)
+	{
+		int3 Oi = int3(O & 1u, (O >> 1u) & 1u, (O >> 2u) & 1u);
+		int3 Node = clamp(Base + Oi, 0, GridDim - 1);
+		float3 W3 = lerp(1.0 - Fr, Fr, float3(Oi));
+		uint F = FaceIndex(Axis, Node);
+		float Uf = Vel[F];
+		if (bCheckKnown)
+		{
+			if ((FaceFlags[F] & KnownMask) == 0u)
+			{
+				Uf = Fallback;
+			}
+		}
+		U += W3.x * W3.y * W3.z * Uf;
+	}
+	return U;
+}
+
+float3 SampleVelocity(float3 Xp, float3 Fallback, bool bCheckKnown)
+{
+	return float3(SampleVelocityComponent(0, Xp, Fallback.x, bCheckKnown), SampleVelocityComponent(1, Xp, Fallback.y, bCheckKnown),
+		SampleVelocityComponent(2, Xp, Fallback.z, bCheckKnown));
+}
+
+// Returns the brick the particle ends in (brick pool touch for the next substep).
+uint AdvectParticle(uint I)
+{
+	FSloshParticle P = UnpackParticle(Particles[I]);
+	float3 Lo = CellSize * 1.01;
+	float3 Hi = (float3(GridDim) - 1.01) * CellSize;
+
+	float3 Pic, Delta, DeltaW;
+	float3 Gx, Gy, Gz;
+	GatherComponent(0, P.Pos, Pic.x, Delta.x, DeltaW.x, Gx);
+	GatherComponent(1, P.Pos, Pic.y, Delta.y, DeltaW.y, Gy);
+	GatherComponent(2, P.Pos, Pic.z, Delta.z, DeltaW.z, Gz);
+
+	float3 NewVel;
+	if (bUseAPIC)
+	{
+		NewVel = Pic;
+		P.Cx = Gx;
+		P.Cy = Gy;
+		P.Cz = Gz;
+	}
+	else
+	{
+		// Faces that received no P2G weight have no FLIP reference; fall back to PIC there.
+		float3 FlipDelta;
+		[unroll]
+		for (uint Axis = 0; Axis < 3; ++Axis)
+		{
+			FlipDelta[Axis] = DeltaW[Axis] > 1e-4 ? Delta[Axis] / DeltaW[Axis] : Pic[Axis] - P.Vel[Axis];
+		}
+		NewVel = lerp(Pic, P.Vel + FlipDelta, FlipRatio);
+		P.Cx = 0;
+		P.Cy = 0;
+		P.Cz = 0;
+	}
+
+	// RK2 (midpoint) advection through the post-projection grid field. The midpoint velocity only describes the
+	// particle's path while the midpoint stays near it: a fast droplet (0.5 dt |v| of several cells) would sample
+	// the field far ahead, e.g. still liquid below a falling droplet, hover there and gain speed under gravity until
+	// MaxSpeed for good (R-21). Blend to forward Euler with the particle's own grid velocity between a midpoint
+	// distance of one and two cells.
+	// Within one cell the midpoint stencil stays inside the extrapolated band, so faces are only tested beyond that.
+	float3 V1 = Pic;
+	float3 Mid = clamp(P.Pos + 0.5 * Dt * V1, Lo, Hi);
+	float MidCells = 0.5 * Dt * length(V1) * InvCellSize;
+	float3 V2 = V1;
+	if (MidCells < 2.0)
+	{
+		V2 = lerp(SampleVelocity(Mid, V1, MidCells > 1.0), V1, saturate(MidCells - 1.0));
+	}
+	float3 X = P.Pos + Dt * V2;
+	if (bApplyDensityProjection != 0u)
+	{
+		// Position-only shift from the two-sided density projection (density was measured at P.Pos).
+		X += SampleDensityDisplacement(clamp(P.Pos, Lo, Hi));
+	}
+
+	// Pool exhausted (SparseStorageBudget too small): no grid storage under this particle, so the gathers above
+	// read the null brick's zeros. Move it ballistically instead of freezing it in place.
+	if (IsNullCell(CellIndex(clamp(int3(floor(P.Pos * InvCellSize)), 0, GridDim - 1))))
+	{
+		NewVel = P.Vel + Gravity * Dt;
+		X = P.Pos + Dt * NewVel;
+		P.Cx = 0;
+		P.Cy = 0;
+		P.Cz = 0;
+	}
+
+	// Collider response: project out of penetrating SDFs, remove inward relative normal velocity,
+	// apply Coulomb-like tangential friction relative to the moving surface.
+	for (uint K = 0; K < NumColliders; ++K)
+	{
+		FSloshCollider C = Colliders[K];
+		float D = ColliderSDF(C, X);
+		if (D < ParticleRadius)
+		{
+			float3 N = ColliderNormal(C, X, 0.25 * CellSize);
+			X += N * (ParticleRadius - D);
+			float3 Vs = ColliderVelocityAt(C, X);
+			float3 Rel = NewVel - Vs;
+			float Vn = dot(Rel, N);
+			if (Vn < 0.0)
+			{
+				Rel -= Vn * N;
+				Rel -= Friction * (Rel - dot(Rel, N) * N);
+			}
+			NewVel = Vs + Rel;
+		}
+	}
+
+	// Domain walls.
+	[unroll]
+	for (uint Axis = 0; Axis < 3; ++Axis)
+	{
+		if (X[Axis] < Lo[Axis])
+		{
+			X[Axis] = Lo[Axis];
+			NewVel[Axis] = max(NewVel[Axis], 0.0);
+		}
+		else if (X[Axis] > Hi[Axis])
+		{
+			X[Axis] = Hi[Axis];
+			NewVel[Axis] = min(NewVel[Axis], 0.0);
+		}
+	}
+
+	float Speed = length(NewVel);
+	if (Speed > MaxSpeed)
+	{
+		// Diagnostics: clamped particles, their centroid (cm), and how many started inside a solid cell.
+		InterlockedAdd(Stats[9], 1u);
+		InterlockedAdd(Stats[10], uint(X.x * 100.0));
+		InterlockedAdd(Stats[11], uint(X.y * 100.0));
+		InterlockedAdd(Stats[12], uint(X.z * 100.0));
+		if (TypeOf(GetCellType(int3(floor(P.Pos * InvCellSize)))) == CELL_SOLID)
+		{
+			InterlockedAdd(Stats[13], 1u);
+		}
+	}
+
+	P.Pos = X;
+	P.Vel = NewVel;
+	P.Age += Dt;
+	Particles[I] = PackParticle(P);
+	InterlockedMax(Stats[0], asuint(Speed));
+	return BrickIndexOf(clamp(int3(floor(X * InvCellSize)), 0, GridDim - 1) >> 3);
+}
+
+// Particles are spatially sorted, so a group mostly ends in one or two bricks: only the first thread of each run
+// of equal bricks writes the touch flag (millions of same-address writes are not free).
+groupshared uint TouchBrick[SLOSH_THREADS];
+
+[numthreads(SLOSH_THREADS, 1, 1)]
+void G2PAdvectCS(uint3 DTid : SV_DispatchThreadID, uint GroupThread : SV_GroupIndex)
+{
+	uint Brick = LinearThreadId(DTid, SLOSH_THREADS) < NumParticles ? AdvectParticle(LinearThreadId(DTid, SLOSH_THREADS)) : SLOSH_NO_BRICK;
+	TouchBrick[GroupThread] = Brick;
+	GroupMemoryBarrierWithGroupSync();
+	if (Brick != SLOSH_NO_BRICK && (GroupThread == 0u || TouchBrick[GroupThread - 1u] != Brick))
+	{
+		BrickTouch[Brick] = 1u;
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-cell entry points for the face passes: each allocated cell owns its three min faces, so every
+// stored face is processed exactly once.
+// ---------------------------------------------------------------------------------------------
+#define SLOSH_FACE_KERNEL(EntryName, FaceFunction) \
+	[numthreads(SLOSH_THREADS, 1, 1)] \
+	void EntryName(uint3 DTid : SV_DispatchThreadID) \
+	{ \
+		uint Index; \
+		int3 C; \
+		if (!SparseCell(LinearThreadId(DTid, SLOSH_THREADS), Index, C)) \
+		{ \
+			return; \
+		} \
+		[unroll] for (uint A_ = 0; A_ < 3; ++A_) \
+		{ \
+			FaceFunction(A_ * PoolCells + Index, A_, C); \
+		} \
+	}
+
+SLOSH_FACE_KERNEL(NormalizeFacesCS, NormalizeFace)
+SLOSH_FACE_KERNEL(ViscosityJacobiCS, ViscosityJacobiFace)
+SLOSH_FACE_KERNEL(ProjectCS, ProjectFace)
+SLOSH_FACE_KERNEL(ExtrapolateCS, ExtrapolateFace)
+SLOSH_FACE_KERNEL(DensityDisplacementCS, DensityDisplacementFace)
+
+// ---------------------------------------------------------------------------------------------
+// Brick pool allocation, at the start of every substep (before BuildSolid and P2G):
+//   (touch)          bricks holding particles, marked by G2PAdvectCS (end positions of the previous substep)
+//                    and EmitParticlesCS. A separate pass re-reading every 64-byte particle cost 0.2-1 ms.
+//   BrickFreeCS      wanted = touched bricks dilated by one brick, which covers every P2G/G2P stencil, the
+//                    advection reach (CFL < 8 cells) and the extrapolation band. Allocated bricks that are no
+//                    longer wanted push their slot onto the free stack.
+//   BrickAllocCS     wanted bricks without storage pop a slot; when the pool is exhausted Stats[8] counts the
+//                    miss and the brick stays on the null brick. Every allocated brick joins the active list.
+//   PoolArgsCS       indirect arguments: active cells, their MG level-1 cells, new slots.
+//   ClearNewSlotsCS  zero what a recycled slot is read with before being written (pressure warm start,
+//                    particle counts, density potential). Every other cell/face value is rewritten each substep.
+// ---------------------------------------------------------------------------------------------
+[numthreads(SLOSH_THREADS, 1, 1)]
+void BrickFreeCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint Brick = LinearThreadId(DTid, SLOSH_THREADS);
+	if (Brick == 0u)
+	{
+		RWActiveBricks[0] = 0u;
+		NewSlots[0] = 0u;
+	}
+	if (Brick >= NumBricks)
+	{
+		return;
+	}
+	int3 B = BrickCoordOf(Brick);
+	bool bWanted = false;
+	for (int Z = -1; Z <= 1; ++Z)
+	{
+		for (int Y = -1; Y <= 1; ++Y)
+		{
+			for (int X = -1; X <= 1; ++X)
+			{
+				int3 N = B + int3(X, Y, Z);
+				if (all(N >= 0) && all(N < BrickDim))
+				{
+					bWanted = bWanted || BrickTouch[BrickIndexOf(N)] != 0u;
+				}
+			}
+		}
+	}
+	BrickWant[Brick] = bWanted ? 1u : 0u;
+	uint Slot = RWBrickTable[Brick];
+	if (!bWanted && Slot != 0u)
+	{
+		RWBrickTable[Brick] = 0u;
+		RWSlotBrick[Slot] = SLOSH_NO_BRICK;
+		uint Count;
+		InterlockedAdd(FreeSlots[0], 1u, Count);
+		FreeSlots[1u + Count] = Slot;
+	}
+}
+
+[numthreads(SLOSH_THREADS, 1, 1)]
+void BrickAllocCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint Brick = LinearThreadId(DTid, SLOSH_THREADS);
+	if (Brick >= NumBricks)
+	{
+		return;
+	}
+	BrickTouch[Brick] = 0u;   // consumed by BrickFreeCS; ready for the next substep
+	if (BrickWant[Brick] == 0u)
+	{
+		return;
+	}
+	uint Slot = RWBrickTable[Brick];
+	if (Slot == 0u)
+	{
+		uint Count;
+		InterlockedAdd(FreeSlots[0], 0xFFFFFFFFu, Count);
+		if (int(Count) <= 0)
+		{
+			InterlockedAdd(Stats[8], 1u);   // pool exhausted (PoolArgsCS repairs the count)
+			return;
+		}
+		Slot = FreeSlots[Count];
+		RWBrickTable[Brick] = Slot;
+		RWSlotBrick[Slot] = Brick;
+		uint NewEntry;
+		InterlockedAdd(NewSlots[0], 1u, NewEntry);
+		NewSlots[1u + NewEntry] = Slot;
+	}
+	uint Entry;
+	InterlockedAdd(RWActiveBricks[0], 1u, Entry);
+	RWActiveBricks[1u + Entry] = Brick;
+}
+
+// Indirect args for Groups groups, wrapped into rows like Slosh::GroupCount1D.
+void WriteDispatchArgs(uint Offset, uint Groups)
+{
+	SparseArgsOut[Offset + 0u] = min(Groups, SLOSH_ROW_GROUPS);
+	SparseArgsOut[Offset + 1u] = (Groups + SLOSH_ROW_GROUPS - 1u) / SLOSH_ROW_GROUPS;
+	SparseArgsOut[Offset + 2u] = 1u;
+}
+
+[numthreads(1, 1, 1)]
+void PoolArgsCS()
+{
+	if (int(FreeSlots[0]) < 0)
+	{
+		FreeSlots[0] = 0u;
+	}
+	uint Active = RWActiveBricks[0];
+	// 512 cells per brick / 128 threads per group = 4 groups per brick.
+	WriteDispatchArgs(0u, Active * (SLOSH_BRICK_CELLS / SLOSH_THREADS));
+	// The 4^3 MG level-1 cells per active brick (MGPCG restriction).
+	WriteDispatchArgs(3u, (Active * 64u + SLOSH_THREADS - 1u) / SLOSH_THREADS);
+	WriteDispatchArgs(6u, NewSlots[0] * (SLOSH_BRICK_CELLS / SLOSH_THREADS));
+	InterlockedMax(Stats[7], Active);
+}
+
+[numthreads(SLOSH_THREADS, 1, 1)]
+void ClearNewSlotsCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint Entry = LinearThreadId(DTid, SLOSH_THREADS) / SLOSH_BRICK_CELLS;
+	if (Entry >= NewSlots[0])
+	{
+		return;
+	}
+	uint Index = NewSlots[1u + Entry] * SLOSH_BRICK_CELLS + LinearThreadId(DTid, SLOSH_THREADS) % SLOSH_BRICK_CELLS;
+	Pressure[Index] = 0.0;
+	CellCount[Index] = 0;
+	DensityQ[Index] = 0.0;
+}

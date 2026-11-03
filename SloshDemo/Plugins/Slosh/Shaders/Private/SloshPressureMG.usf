@@ -1,0 +1,543 @@
+// Copyright notice: see Plugins/Slosh/NOTICE.md.
+// Multigrid-preconditioned conjugate gradient (MGPCG) pressure solve, after McAdams, Sifakis & Teran 2010,
+// "A parallel multigrid Poisson solver for fluids simulation on large grids".
+//
+// System (fluid cells only): A p = b,  (A p)_c = diag_c * p_c - sum_{fluid n} p_n,  b = -div.
+//   diag_c = number of non-solid neighbours (+ DiagEpsilon; keeps sealed pockets non-singular).
+// Coarse levels: cell is AIR if any child is AIR, FLUID if any child is FLUID, else SOLID.
+// Transfer: piecewise-constant prolongation P, restriction R = P^T, coarse operator = 4 * L_coarse
+//   (Galerkin product of P^T A P for the 7-point stencil), so the coarse RHS is (R r) / 4.
+// Smoother: red-black Gauss-Seidel, red-black before restriction and black-red after (symmetric V-cycle).
+// All scalars (dot products, alpha, beta) live in a GPU buffer; no CPU readback.
+
+#include "SloshCommon.ush"
+
+#define MG_THREADS 128
+#define MG_FINALIZE_THREADS 256
+#define MG_COARSE_THREADS 256
+
+int3  FineDim;
+int3  CoarseDim;
+uint  FineCells;
+uint  CoarseCells;
+uint  Parity;
+uint  bAccumulateDot;
+uint  bFirstIteration;
+uint  DotSlot;
+uint  bShiftRho;
+uint  NumPartials;
+uint  CoarseIterations;
+float DiagEpsilon;
+uint  bGhostDiag;     // level 0 only: use the solver's ghost-fluid diagonal (DiagF) instead of counting neighbours
+uint  bSparse;        // level 0 only: iterate the active-brick list instead of scanning every pool slot
+uint  bPooledFine;    // the fine level is level 0, stored in the brick pool (Slosh.usf); coarser levels are dense
+uint  NumPoolBricks;
+int3  BrickDim;
+
+RWStructuredBuffer<uint>  TypeF;
+RWStructuredBuffer<uint>  TypeC;
+RWStructuredBuffer<float> XF;
+RWStructuredBuffer<float> BF;
+RWStructuredBuffer<float> XC;
+RWStructuredBuffer<float> BC;
+RWStructuredBuffer<float> P;
+RWStructuredBuffer<float> R;
+RWStructuredBuffer<float> Z;
+RWStructuredBuffer<float> D;
+RWStructuredBuffer<float> Q;
+RWStructuredBuffer<float> Div;
+RWStructuredBuffer<float> Partials;
+RWStructuredBuffer<float> Scalars;   // [0] rho = r.z, [1] scratch, [2] d.Ad, [3] previous rho
+StructuredBuffer<float>   DiagF;     // level-0 operator diagonal (Slosh.usf DivergenceCS); read-only (SM5 allows 8 UAVs)
+StructuredBuffer<uint>    ActiveBricks; // [0] = active brick count, [1 + i] = brick index; read-only
+StructuredBuffer<uint>    BrickTable;   // per brick: pool slot (0 = null brick)
+StructuredBuffer<uint>    SlotBrick;    // per pool slot: brick index (MG_NO_BRICK = free)
+
+groupshared float GroupSum[MG_FINALIZE_THREADS];
+
+uint LinearIndex(int3 C, int3 Dim)
+{
+	return uint(C.x + Dim.x * (C.y + Dim.y * C.z));
+}
+
+int3 Coord(uint Index, int3 Dim)
+{
+	return int3(int(Index % uint(Dim.x)), int((Index / uint(Dim.x)) % uint(Dim.y)), int(Index / uint(Dim.x * Dim.y)));
+}
+
+bool Inside(int3 C, int3 Dim)
+{
+	return all(C >= 0) && all(C < Dim);
+}
+
+// Level 0 lives in the simulation's brick pool: 512-cell slots, BrickTable maps 8^3 bricks to slots, slot 0
+// is the zeroed null brick (unallocated cells read as air). See Slosh.usf.
+#define MG_BRICK_CELLS 512u
+#define MG_NO_BRICK 0xFFFFFFFFu
+
+int3 BrickCoordOf(uint Brick)
+{
+	return int3(int(Brick % uint(BrickDim.x)), int((Brick / uint(BrickDim.x)) % uint(BrickDim.y)), int(Brick / uint(BrickDim.x * BrickDim.y)));
+}
+
+int3 BrickLocalCoord(uint L)
+{
+	return int3(int(L % 8u), int((L / 8u) % 8u), int(L / 64u));
+}
+
+uint FineIndex(int3 C)
+{
+	if (bPooledFine == 0u)
+	{
+		return LinearIndex(C, FineDim);
+	}
+	uint Slot = 0u;
+	if (Inside(C, FineDim))
+	{
+		int3 B = C >> 3;
+		Slot = BrickTable[uint(B.x + BrickDim.x * (B.y + BrickDim.y * B.z))];
+	}
+	int3 L = C & 7;
+	return Slot * MG_BRICK_CELLS + uint(L.x + 8 * (L.y + 8 * L.z));
+}
+
+uint FineTypeAt(int3 C)
+{
+	return Inside(C, FineDim) ? (TypeF[FineIndex(C)] & CELL_TYPE_MASK) : CELL_SOLID;
+}
+
+uint CoarseTypeAt(int3 C)
+{
+	return Inside(C, CoarseDim) ? (TypeC[LinearIndex(C, CoarseDim)] & CELL_TYPE_MASK) : CELL_SOLID;
+}
+
+int3 NeighbourOffset(uint N)
+{
+	int3 O = int3(0, 0, 0);
+	O[N >> 1u] = (N & 1u) ? 1 : -1;
+	return O;
+}
+
+// Index of neighbour N of fine cell (C, I). On the pooled level 0 a neighbour inside the same 8^3 brick sits at a fixed
+// offset in the slot (+-1, +-8, +-64), so only brick-boundary neighbours pay the BrickTable lookup.
+uint FineNeighbourIndex(uint I, int3 C, uint N)
+{
+	int3 Nb = C + NeighbourOffset(N);
+	if (bPooledFine == 0u)
+	{
+		return LinearIndex(Nb, FineDim);
+	}
+	uint Axis = N >> 1u;
+	int L = C[Axis] & 7;
+	bool bPlus = (N & 1u) != 0u;
+	if (bPlus ? L < 7 : L > 0)
+	{
+		uint Stride = Axis == 0u ? 1u : (Axis == 1u ? 8u : 64u);
+		return bPlus ? I + Stride : I - Stride;
+	}
+	return FineIndex(Nb);
+}
+
+// Diagonal and the sum of fluid-neighbour values of a buffer on the fine level (cell Cell at index Index).
+#define FINE_STENCIL(Buffer, Cell, Index, OutDiag, OutSum) \
+	{ \
+		OutDiag = DiagEpsilon; \
+		OutSum = 0.0; \
+		[unroll] for (uint N_ = 0; N_ < 6; ++N_) \
+		{ \
+			if (Inside((Cell) + NeighbourOffset(N_), FineDim)) \
+			{ \
+				uint NbI_ = FineNeighbourIndex((Index), (Cell), N_); \
+				uint T_ = TypeF[NbI_] & CELL_TYPE_MASK; \
+				if (T_ != CELL_SOLID) { OutDiag += 1.0; } \
+				if (T_ == CELL_FLUID) { OutSum += Buffer[NbI_]; } \
+			} \
+		} \
+		if (bGhostDiag != 0u) { OutDiag = DiagF[(Index)] + DiagEpsilon; } \
+	}
+
+// Thread -> cell of the fine level. Dense levels: every cell. Level 0: the active-brick list (bSparse,
+// indirect dispatch) or a scan of every pool slot (free slots exit).
+int3 ActiveBrickCoord(uint Slot)
+{
+	return BrickCoordOf(ActiveBricks[1u + Slot]);
+}
+
+bool SparseFine(uint Thread, out uint I, out int3 C)
+{
+	I = Thread;
+	C = int3(0, 0, 0);
+	if (bPooledFine == 0u)
+	{
+		C = Coord(Thread, FineDim);
+		return Thread < FineCells;
+	}
+	uint Entry = Thread / MG_BRICK_CELLS;
+	uint L = Thread % MG_BRICK_CELLS;
+	uint Brick;
+	uint Slot;
+	if (bSparse != 0u)
+	{
+		if (Entry >= ActiveBricks[0])
+		{
+			return false;
+		}
+		Brick = ActiveBricks[1u + Entry];
+		Slot = BrickTable[Brick];
+	}
+	else
+	{
+		Slot = 1u + Entry;
+		if (Slot >= NumPoolBricks)
+		{
+			return false;
+		}
+		Brick = SlotBrick[Slot];
+		if (Brick == MG_NO_BRICK)
+		{
+			return false;
+		}
+	}
+	C = BrickCoordOf(Brick) * 8 + BrickLocalCoord(L);
+	I = Slot * MG_BRICK_CELLS + L;
+	return Inside(C, FineDim);
+}
+
+bool SparseCoarse(uint Thread, out uint I)
+{
+	I = Thread;
+	if (bSparse == 0u)
+	{
+		return Thread < CoarseCells;
+	}
+	uint Slot = Thread / 64u;
+	if (Slot >= ActiveBricks[0])
+	{
+		return false;
+	}
+	uint L = Thread % 64u;
+	int3 C = ActiveBrickCoord(Slot) * 4 + int3(int(L % 4u), int((L / 4u) % 4u), int(L / 16u));
+	if (!Inside(C, CoarseDim))
+	{
+		return false;
+	}
+	I = LinearIndex(C, CoarseDim);
+	return true;
+}
+
+bool IsRed(int3 C)
+{
+	return ((uint(C.x + C.y + C.z)) & 1u) == 0u;
+}
+
+// Block reduction of one value per thread into Partials[GroupId] (128-thread groups).
+void GroupReduceToPartial(float Value, uint GroupThread, uint GroupId)
+{
+	GroupSum[GroupThread] = Value;
+	GroupMemoryBarrierWithGroupSync();
+	[unroll]
+	for (uint Stride = MG_THREADS / 2; Stride > 0; Stride >>= 1)
+	{
+		if (GroupThread < Stride)
+		{
+			GroupSum[GroupThread] += GroupSum[GroupThread + Stride];
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if (GroupThread == 0 && GroupId < NumPartials)   // row-wrapped dispatches can have extra groups
+	{
+		Partials[GroupId] = GroupSum[0];
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Coarse cell classification (once per solve per level).
+// ---------------------------------------------------------------------------------------------
+[numthreads(MG_THREADS, 1, 1)]
+void MGBuildTypeCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (LinearThreadId(DTid, MG_THREADS) >= CoarseCells)
+	{
+		return;
+	}
+	int3 C = Coord(LinearThreadId(DTid, MG_THREADS), CoarseDim);
+	bool bAnyAir = false;
+	bool bAnyFluid = false;
+	[unroll]
+	for (uint O = 0; O < 8; ++O)
+	{
+		int3 F = C * 2 + int3(O & 1u, (O >> 1u) & 1u, (O >> 2u) & 1u);
+		if (Inside(F, FineDim))
+		{
+			uint T = FineTypeAt(F);
+			bAnyAir = bAnyAir || T == CELL_AIR;
+			bAnyFluid = bAnyFluid || T == CELL_FLUID;
+		}
+	}
+	TypeC[LinearThreadId(DTid, MG_THREADS)] = bAnyAir ? CELL_AIR : (bAnyFluid ? CELL_FLUID : CELL_SOLID);
+}
+
+// ---------------------------------------------------------------------------------------------
+// r = b - A p (warm start), then the first red pre-smoothing sweep of the V-cycle (x starts at 0,
+// so red cells only need their own residual): z_red = r / diag, z_black = 0.
+// ---------------------------------------------------------------------------------------------
+[numthreads(MG_THREADS, 1, 1)]
+void PCGInitCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I;
+	int3 C;
+	if (!SparseFine(LinearThreadId(DTid, MG_THREADS), I, C))
+	{
+		return;
+	}
+	if ((TypeF[I] & CELL_TYPE_MASK) != CELL_FLUID)
+	{
+		R[I] = 0.0;
+		Z[I] = 0.0;
+		D[I] = 0.0;
+		return;
+	}
+	float Diag, Sum;
+	FINE_STENCIL(P, C, I, Diag, Sum);
+	float Ri = -Div[I] - (Diag * P[I] - Sum);
+	R[I] = Ri;
+	Z[I] = IsRed(C) ? Ri / Diag : 0.0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// One Gauss-Seidel colour sweep on any level (FineDim/TypeF/XF/BF describe that level).
+// With bAccumulateDot, also reduces BF.XF over all cells (used for rho = r.z on the last sweep).
+// ---------------------------------------------------------------------------------------------
+[numthreads(MG_THREADS, 1, 1)]
+void MGSmoothCS(uint3 DTid : SV_DispatchThreadID, uint GroupThread : SV_GroupIndex, uint3 GroupId : SV_GroupID)
+{
+	uint I;
+	int3 C;
+	bool bValid = SparseFine(LinearThreadId(DTid, MG_THREADS), I, C);
+	float DotValue = 0.0;
+	if (bValid && (TypeF[I] & CELL_TYPE_MASK) == CELL_FLUID)
+	{
+		if ((IsRed(C) ? 0u : 1u) == Parity)
+		{
+			float Diag, Sum;
+			FINE_STENCIL(XF, C, I, Diag, Sum);
+			float B = BF[I];
+			float X = (B + Sum) / Diag;
+			XF[I] = X;
+			DotValue = B * X;
+		}
+		else if (bAccumulateDot != 0u)
+		{
+			DotValue = BF[I] * XF[I];
+		}
+	}
+	if (bAccumulateDot != 0u)
+	{
+		GroupReduceToPartial(DotValue, GroupThread, LinearGroupId(GroupId));
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Restriction: b_c = (sum of the children's residuals) / 4, x_c initialised with the red sweep.
+// ---------------------------------------------------------------------------------------------
+[numthreads(MG_THREADS, 1, 1)]
+void MGRestrictCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint CI;
+	if (!SparseCoarse(LinearThreadId(DTid, MG_THREADS), CI))
+	{
+		return;
+	}
+	int3 C = Coord(CI, CoarseDim);
+	if ((TypeC[CI] & CELL_TYPE_MASK) != CELL_FLUID)
+	{
+		BC[CI] = 0.0;
+		XC[CI] = 0.0;
+		return;
+	}
+	float Sum = 0.0;
+	[unroll]
+	for (uint O = 0; O < 8; ++O)
+	{
+		int3 F = C * 2 + int3(O & 1u, (O >> 1u) & 1u, (O >> 2u) & 1u);
+		if (Inside(F, FineDim) && FineTypeAt(F) == CELL_FLUID)
+		{
+			uint Fi = FineIndex(F);
+			float Diag, NbSum;
+			FINE_STENCIL(XF, F, Fi, Diag, NbSum);
+			Sum += BF[Fi] - (Diag * XF[Fi] - NbSum);
+		}
+	}
+	float B = 0.25 * Sum;
+	BC[CI] = B;
+
+	float CoarseDiag = DiagEpsilon;
+	[unroll]
+	for (uint N = 0; N < 6; ++N)
+	{
+		CoarseDiag += CoarseTypeAt(C + NeighbourOffset(N)) != CELL_SOLID ? 1.0 : 0.0;
+	}
+	XC[CI] = IsRed(C) ? B / CoarseDiag : 0.0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Coarsest level: many red-black sweeps inside one thread group (level is small).
+// ---------------------------------------------------------------------------------------------
+[numthreads(MG_COARSE_THREADS, 1, 1)]
+void MGCoarseSolveCS(uint GroupThread : SV_GroupIndex)
+{
+	// Uniform trip counts everywhere so every thread reaches each barrier.
+	const uint CellsPerThread = (FineCells + MG_COARSE_THREADS - 1) / MG_COARSE_THREADS;
+	for (uint It = 0; It < CoarseIterations; ++It)
+	{
+		for (uint Colour = 0; Colour < 2; ++Colour)
+		{
+			for (uint K = 0; K < CellsPerThread; ++K)
+			{
+				uint Linear = GroupThread + K * MG_COARSE_THREADS;
+				if (Linear < FineCells)
+				{
+					int3 C = Coord(Linear, FineDim);
+					uint I = FineIndex(C);
+					if ((TypeF[I] & CELL_TYPE_MASK) == CELL_FLUID && (IsRed(C) ? 0u : 1u) == Colour)
+					{
+						float Diag, Sum;
+						FINE_STENCIL(XF, C, I, Diag, Sum);
+						XF[I] = (BF[I] + Sum) / Diag;
+					}
+				}
+			}
+			DeviceMemoryBarrierWithGroupSync();
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Prolongation (piecewise constant): x_f += x_c(parent) on fluid cells.
+// ---------------------------------------------------------------------------------------------
+[numthreads(MG_THREADS, 1, 1)]
+void MGProlongCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I;
+	int3 C;
+	if (!SparseFine(LinearThreadId(DTid, MG_THREADS), I, C) || (TypeF[I] & CELL_TYPE_MASK) != CELL_FLUID)
+	{
+		return;
+	}
+	int3 Parent = C / 2;
+	uint Pi = LinearIndex(Parent, CoarseDim);
+	if ((TypeC[Pi] & CELL_TYPE_MASK) == CELL_FLUID)
+	{
+		XF[I] += XC[Pi];
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// q = A d, with the d.q partial reduction.
+// ---------------------------------------------------------------------------------------------
+[numthreads(MG_THREADS, 1, 1)]
+void PCGApplyACS(uint3 DTid : SV_DispatchThreadID, uint GroupThread : SV_GroupIndex, uint3 GroupId : SV_GroupID)
+{
+	uint I;
+	int3 C;
+	bool bValid = SparseFine(LinearThreadId(DTid, MG_THREADS), I, C);
+	float DotValue = 0.0;
+	if (bValid && (TypeF[I] & CELL_TYPE_MASK) == CELL_FLUID)
+	{
+		float Diag, Sum;
+		FINE_STENCIL(D, C, I, Diag, Sum);
+		float Qi = Diag * D[I] - Sum;
+		Q[I] = Qi;
+		DotValue = D[I] * Qi;
+	}
+	GroupReduceToPartial(DotValue, GroupThread, LinearGroupId(GroupId));
+}
+
+// Single group: Scalars[DotSlot] = sum(Partials). With bShiftRho the previous rho moves to slot 3.
+[numthreads(MG_FINALIZE_THREADS, 1, 1)]
+void PCGFinalizeDotCS(uint GroupThread : SV_GroupIndex)
+{
+	float Sum = 0.0;
+	// Sparse dispatches write 4 partials (groups) per active brick; ignore stale entries beyond them.
+	// The loop bound stays the uniform dense count so every thread reaches the barrier below.
+	const uint Written = bSparse != 0u ? min(ActiveBricks[0] * 4u, NumPartials) : NumPartials;
+	const uint PerThread = (NumPartials + MG_FINALIZE_THREADS - 1) / MG_FINALIZE_THREADS;
+	for (uint K = 0; K < PerThread; ++K)
+	{
+		uint I = GroupThread + K * MG_FINALIZE_THREADS;
+		if (I < Written)
+		{
+			Sum += Partials[I];
+		}
+	}
+	GroupSum[GroupThread] = Sum;
+	GroupMemoryBarrierWithGroupSync();
+	[unroll]
+	for (uint Stride = MG_FINALIZE_THREADS / 2; Stride > 0; Stride >>= 1)
+	{
+		if (GroupThread < Stride)
+		{
+			GroupSum[GroupThread] += GroupSum[GroupThread + Stride];
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if (GroupThread == 0)
+	{
+		if (bShiftRho != 0u)
+		{
+			Scalars[3] = Scalars[0];
+		}
+		Scalars[DotSlot] = GroupSum[0];
+	}
+}
+
+// p += alpha d, r -= alpha q, then the red pre-smoothing sweep for the next preconditioner apply.
+[numthreads(MG_THREADS, 1, 1)]
+void PCGUpdatePRCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I;
+	int3 C;
+	if (!SparseFine(LinearThreadId(DTid, MG_THREADS), I, C) || (TypeF[I] & CELL_TYPE_MASK) != CELL_FLUID)
+	{
+		return;
+	}
+	float Dq = Scalars[2];
+	float Alpha = abs(Dq) > 1e-30 ? Scalars[0] / Dq : 0.0;
+	P[I] += Alpha * D[I];
+	float Ri = R[I] - Alpha * Q[I];
+	R[I] = Ri;
+
+	float Diag = DiagEpsilon;
+	if (bGhostDiag != 0u)
+	{
+		Diag = DiagF[I] + DiagEpsilon;
+	}
+	else
+	{
+		[unroll]
+		for (uint N = 0; N < 6; ++N)
+		{
+			Diag += FineTypeAt(C + NeighbourOffset(N)) != CELL_SOLID ? 1.0 : 0.0;
+		}
+	}
+	Z[I] = IsRed(C) ? Ri / Diag : 0.0;
+}
+
+// d = z + beta d
+[numthreads(MG_THREADS, 1, 1)]
+void PCGUpdateDCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I;
+	int3 C;
+	if (!SparseFine(LinearThreadId(DTid, MG_THREADS), I, C) || (TypeF[I] & CELL_TYPE_MASK) != CELL_FLUID)
+	{
+		return;
+	}
+	float Beta = 0.0;
+	if (bFirstIteration == 0u)
+	{
+		float RhoOld = Scalars[3];
+		Beta = abs(RhoOld) > 1e-30 ? Scalars[0] / RhoOld : 0.0;
+	}
+	D[I] = Z[I] + Beta * D[I];
+}

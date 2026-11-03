@@ -1,0 +1,138 @@
+// Copyright notice: see Plugins/Slosh/NOTICE.md.
+// Counting sort of particles by 4x4x4 brick, so neighbouring threads in P2G/G2P
+// touch neighbouring MAC faces (cache locality for gathers, L2 locality for scatter atomics).
+//
+//   Count:   rank_i = atomicAdd(count[key_i], 1)
+//   Scan:    offsets = exclusive_scan(count) in 1024-key blocks, then a scan of block sums, then add-back
+//   Scatter: out[offsets[key_i] + rank_i] = in[i]
+
+#include "SloshCommon.ush"
+
+#define SORT_THREADS 128
+#define SCAN_THREADS 256
+#define SCAN_PER_THREAD 4
+#define SCAN_BLOCK (SCAN_THREADS * SCAN_PER_THREAD)
+
+int3  GridDim;
+int3  BrickDim;
+float InvCellSize;
+uint  NumParticles;
+uint  NumSortKeys;
+uint  NumScanBlocks;
+
+RWStructuredBuffer<FSloshParticlePacked> Particles;
+RWStructuredBuffer<FSloshParticlePacked> ParticlesOut;
+RWStructuredBuffer<uint> SortRank;
+RWStructuredBuffer<uint> SortCounts;
+RWStructuredBuffer<uint> SortOffsets;
+RWStructuredBuffer<uint> ScanBlockSums;
+
+groupshared uint ScanShared[SCAN_THREADS];
+
+// One key per 4^3 brick: groups of 128 sorted particles stay within one or two bricks, which is all the 8^3
+// P2G tile needs, and the count/offset arrays are 64x smaller than per-cell keys.
+uint SortKey(float3 Pos)
+{
+	int3 C = clamp(int3(floor(Pos * InvCellSize)), 0, GridDim - 1);
+	int3 B = C >> 2;
+	return uint(B.x + BrickDim.x * (B.y + BrickDim.y * B.z));
+}
+
+// Inclusive Hillis-Steele scan of one value per thread over the group.
+uint GroupInclusiveScan(uint Value, uint GroupThread)
+{
+	ScanShared[GroupThread] = Value;
+	GroupMemoryBarrierWithGroupSync();
+	[unroll]
+	for (uint Offset = 1; Offset < SCAN_THREADS; Offset <<= 1)
+	{
+		uint Add = GroupThread >= Offset ? ScanShared[GroupThread - Offset] : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		ScanShared[GroupThread] += Add;
+		GroupMemoryBarrierWithGroupSync();
+	}
+	return ScanShared[GroupThread];
+}
+
+[numthreads(SORT_THREADS, 1, 1)]
+void SortCountCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I = LinearThreadId(DTid, SORT_THREADS);
+	if (I >= NumParticles)
+	{
+		return;
+	}
+	uint Rank;
+	InterlockedAdd(SortCounts[SortKey(Particles[I].Pos)], 1u, Rank);
+	SortRank[I] = Rank;
+}
+
+[numthreads(SCAN_THREADS, 1, 1)]
+void SortScanBlocksCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+	uint Base = GroupId.x * SCAN_BLOCK + GroupThread * SCAN_PER_THREAD;
+	uint Values[SCAN_PER_THREAD];
+	uint Sum = 0;
+	[unroll]
+	for (uint K = 0; K < SCAN_PER_THREAD; ++K)
+	{
+		uint Key = Base + K;
+		Values[K] = Key < NumSortKeys ? SortCounts[Key] : 0u;
+		Sum += Values[K];
+	}
+	uint Inclusive = GroupInclusiveScan(Sum, GroupThread);
+	uint Running = Inclusive - Sum;
+	[unroll]
+	for (uint K2 = 0; K2 < SCAN_PER_THREAD; ++K2)
+	{
+		uint Key = Base + K2;
+		if (Key < NumSortKeys)
+		{
+			SortOffsets[Key] = Running;
+		}
+		Running += Values[K2];
+	}
+	if (GroupThread == SCAN_THREADS - 1)
+	{
+		ScanBlockSums[GroupId.x] = Inclusive;
+	}
+}
+
+// Single group: exclusive scan of the block sums (any count; each thread owns a contiguous run).
+[numthreads(SCAN_THREADS, 1, 1)]
+void SortScanBlockSumsCS(uint GroupThread : SV_GroupIndex)
+{
+	const uint PerThread = (NumScanBlocks + SCAN_THREADS - 1) / SCAN_THREADS;
+	uint Begin = GroupThread * PerThread;
+	uint Sum = 0;
+	for (uint K = 0; K < PerThread; ++K)
+	{
+		uint I = Begin + K;
+		Sum += I < NumScanBlocks ? ScanBlockSums[I] : 0u;
+	}
+	uint Running = GroupInclusiveScan(Sum, GroupThread) - Sum;
+	for (uint K2 = 0; K2 < PerThread; ++K2)
+	{
+		uint I = Begin + K2;
+		if (I < NumScanBlocks)
+		{
+			uint V = ScanBlockSums[I];
+			ScanBlockSums[I] = Running;
+			Running += V;
+		}
+	}
+}
+
+[numthreads(SORT_THREADS, 1, 1)]
+void SortScatterCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I = LinearThreadId(DTid, SORT_THREADS);
+	if (I >= NumParticles)
+	{
+		return;
+	}
+	FSloshParticlePacked P = Particles[I];
+	uint Key = SortKey(P.Pos);
+	uint Dst = SortOffsets[Key] + ScanBlockSums[Key / SCAN_BLOCK] + SortRank[I];
+	ParticlesOut[Dst] = P;
+}

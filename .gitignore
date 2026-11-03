@@ -1,0 +1,28 @@
+# Unreal build products and caches (host project and plugins)
+SloshDemo/Binaries/
+SloshDemo/Intermediate/
+SloshDemo/Saved/
+SloshDemo/DerivedDataCache/
+SloshDemo/Plugins/*/Binaries/
+SloshDemo/Plugins/*/Intermediate/
+SloshDemo/build.log
+
+# Third-party marketplace content: licensed per user, not redistributable. Install it from Fab instead.
+SloshDemo/Content/FluidNinjaLive/
+
+# IDE and generated project files
+.vs/
+.vscode/
+.idea/
+*.sln
+*.slnx
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+SloshDemo/*.code-workspace
+
+# OS
+Thumbs.db
+.DS_Store

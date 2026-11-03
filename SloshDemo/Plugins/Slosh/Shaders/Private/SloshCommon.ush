@@ -1,0 +1,210 @@
+// Copyright notice: see Plugins/Slosh/NOTICE.md.
+// Shared definitions for the Slosh GPU FLIP/APIC solver.
+//
+// Conventions (sim space, meters, Z up):
+//   Cell (i,j,k) spans [i*h,(i+1)*h] x [j*h,(j+1)*h] x [k*h,(k+1)*h].
+//   MAC faces: U(i,j,k) at (i*h, (j+.5)h, (k+.5)h), dims (NX+1,NY,NZ); V and W analogous.
+//   All three face grids live in one linear buffer at FaceOffsets.{x,y,z}.
+
+#pragma once
+
+#include "/Engine/Public/Platform.ush"
+
+#define SLOSH_THREADS 128
+
+// D3D allows at most 65535 groups per dispatch dimension. 1D dispatches wrap into rows of SLOSH_ROW_GROUPS groups
+// (C++ Slosh::GroupCount1D, indirect args in PoolArgsCS); kernels index threads and groups through these helpers.
+#define SLOSH_ROW_GROUPS 32768u
+uint LinearThreadId(uint3 DTid, uint GroupSize)
+{
+	return DTid.y * (SLOSH_ROW_GROUPS * GroupSize) + DTid.x;
+}
+uint LinearGroupId(uint3 GroupId)
+{
+	return GroupId.y * SLOSH_ROW_GROUPS + GroupId.x;
+}
+
+#define CELL_AIR    0u
+#define CELL_FLUID  1u
+#define CELL_SOLID  2u
+#define CELL_TYPE_MASK 3u
+#define CELL_DENSE_FLAG 4u       // fluid cell holding at least half the rest particle count
+#define CELL_COLLIDER_SHIFT 8u   // bits 8..15: collider index + 1 (0 = domain wall)
+
+#define FACE_VALID      1u       // face carries a meaningful velocity (adjacent to fluid, or a solid face)
+#define FACE_SOLID      2u       // face touches a solid cell; velocity is the solid's normal velocity
+#define FACE_HAS_WEIGHT 4u       // P2G deposited weight on this face (FLIP delta is trustworthy)
+#define FACE_EXTRAP_SHIFT 4u     // bit (FACE_EXTRAP_SHIFT + n) = filled by extrapolation iteration n
+
+#define COLLIDER_SPHERE  0u
+#define COLLIDER_BOX     1u
+#define COLLIDER_CAPSULE 2u
+#define COLLIDER_FLAG_TWO_WAY 1u
+
+#define COUPLING_STRIDE 16u      // ints per collider in the coupling accumulator
+
+// Fixed-point scale for P2G atomics (int32). Momentum per face stays well below 2^31 / 2^20 = 2048.
+#define P2G_FIXED_SCALE 1048576.0
+#define P2G_FIXED_INV   (1.0 / 1048576.0)
+
+// Particle as the kernels use it.
+struct FSloshParticle
+{
+	float3 Pos;   // sim space, meters
+	float3 Vel;   // m/s
+	float3 Cx;    // APIC affine row for the U component
+	float3 Cy;    // ... V component
+	float3 Cz;    // ... W component
+	float  Age;   // seconds since emission
+};
+
+// Particle as stored: 48 bytes (C++ FSloshParticleGPU), the APIC affine matrix as 9 halves. The particle passes are
+// bandwidth-bound (P2G, G2P, sort and splat each stream every particle), so this cuts their traffic by a quarter.
+struct FSloshParticlePacked
+{
+	float3 Pos;
+	float  Age;
+	float3 Vel;
+	uint   C[5];  // halves: Cx.xyz, Cy.xyz, Cz.xyz
+};
+
+uint PackHalf2(float A, float B)
+{
+	return f32tof16(clamp(A, -65000.0, 65000.0)) | (f32tof16(clamp(B, -65000.0, 65000.0)) << 16);
+}
+
+FSloshParticlePacked PackParticle(FSloshParticle P)
+{
+	FSloshParticlePacked S;
+	S.Pos = P.Pos;
+	S.Age = P.Age;
+	S.Vel = P.Vel;
+	S.C[0] = PackHalf2(P.Cx.x, P.Cx.y);
+	S.C[1] = PackHalf2(P.Cx.z, P.Cy.x);
+	S.C[2] = PackHalf2(P.Cy.y, P.Cy.z);
+	S.C[3] = PackHalf2(P.Cz.x, P.Cz.y);
+	S.C[4] = PackHalf2(P.Cz.z, 0.0);
+	return S;
+}
+
+FSloshParticle UnpackParticle(FSloshParticlePacked S)
+{
+	FSloshParticle P;
+	P.Pos = S.Pos;
+	P.Age = S.Age;
+	P.Vel = S.Vel;
+	float2 H0 = f16tof32(uint2(S.C[0], S.C[0] >> 16));
+	float2 H1 = f16tof32(uint2(S.C[1], S.C[1] >> 16));
+	float2 H2 = f16tof32(uint2(S.C[2], S.C[2] >> 16));
+	float2 H3 = f16tof32(uint2(S.C[3], S.C[3] >> 16));
+	float  H4 = f16tof32(S.C[4]);
+	P.Cx = float3(H0.x, H0.y, H1.x);
+	P.Cy = float3(H1.y, H2.x, H2.y);
+	P.Cz = float3(H3.x, H3.y, H4);
+	return P;
+}
+
+struct FSloshCollider
+{
+	float3 Center;
+	uint   Type;
+	float4 Rotation;        // quaternion, collider local -> sim
+	float3 Extent;          // sphere: x = radius; box: half extents; capsule: x = radius, y = half height (local Z)
+	uint   Flags;
+	float3 LinearVelocity;  // sim space, m/s
+	float  Pad0;
+	float3 AngularVelocity; // sim space, rad/s
+	float  Pad1;
+};
+
+uint3 GetFaceDims(uint Axis, int3 InGridDim)
+{
+	uint3 D = uint3(InGridDim);
+	if (Axis == 0) D.x += 1; else if (Axis == 1) D.y += 1; else D.z += 1;
+	return D;
+}
+
+float3 AxisVector(uint Axis)
+{
+	return float3(Axis == 0 ? 1.0 : 0.0, Axis == 1 ? 1.0 : 0.0, Axis == 2 ? 1.0 : 0.0);
+}
+
+int3 AxisOffset(uint Axis)
+{
+	return int3(Axis == 0 ? 1 : 0, Axis == 1 ? 1 : 0, Axis == 2 ? 1 : 0);
+}
+
+float3 QuatRotate(float4 Q, float3 V)
+{
+	float3 T = 2.0 * cross(Q.xyz, V);
+	return V + Q.w * T + cross(Q.xyz, T);
+}
+
+float3 QuatRotateInv(float4 Q, float3 V)
+{
+	return QuatRotate(float4(-Q.xyz, Q.w), V);
+}
+
+float ColliderSDF(FSloshCollider C, float3 P)
+{
+	float3 L = QuatRotateInv(C.Rotation, P - C.Center);
+	if (C.Type == COLLIDER_SPHERE)
+	{
+		return length(L) - C.Extent.x;
+	}
+	else if (C.Type == COLLIDER_BOX)
+	{
+		float3 D = abs(L) - C.Extent;
+		return length(max(D, 0.0)) + min(max(D.x, max(D.y, D.z)), 0.0);
+	}
+	else
+	{
+		L.z -= clamp(L.z, -C.Extent.y, C.Extent.y);
+		return length(L) - C.Extent.x;
+	}
+}
+
+float3 ColliderNormal(FSloshCollider C, float3 P, float Eps)
+{
+	float3 N;
+	N.x = ColliderSDF(C, P + float3(Eps, 0, 0)) - ColliderSDF(C, P - float3(Eps, 0, 0));
+	N.y = ColliderSDF(C, P + float3(0, Eps, 0)) - ColliderSDF(C, P - float3(0, Eps, 0));
+	N.z = ColliderSDF(C, P + float3(0, 0, Eps)) - ColliderSDF(C, P - float3(0, 0, Eps));
+	float Len = length(N);
+	return Len > 1e-8 ? N / Len : float3(0, 0, 1);
+}
+
+float3 ColliderVelocityAt(FSloshCollider C, float3 P)
+{
+	return C.LinearVelocity + cross(C.AngularVelocity, P - C.Center);
+}
+
+// Ghost-fluid free surface (Gibou et al. 2002; Bridson 2015 sec. 5.4). The interface is the 0.5 iso-level of
+// the smooth P2G-weight density rho (1 = rest density), linearly interpolated between a fluid cell and its
+// air neighbour: theta = (rho_f - 0.5) / (rho_f - rho_a) is the fraction of the cell spacing to the surface.
+// The air neighbour then contributes 1/theta to the fluid cell's diagonal (p = 0 at the interface rather than
+// at the air cell centre). Clamped to [GHOST_THETA_MIN, 1]; theta = 1 is the classic first-order condition.
+#define GHOST_THETA_MIN 0.05
+
+float GhostTheta(float RhoFluid, float RhoAir)
+{
+	float Denom = RhoFluid - RhoAir;
+	if (Denom <= 1e-4)
+	{
+		return 1.0;
+	}
+	return clamp((RhoFluid - 0.5) / Denom, GHOST_THETA_MIN, 1.0);
+}
+
+// PCG hash (Jarzynski & Olano 2020).
+uint PcgHash(uint V)
+{
+	uint State = V * 747796405u + 2891336453u;
+	uint Word = ((State >> ((State >> 28u) + 4u)) ^ State) * 277803737u;
+	return (Word >> 22u) ^ Word;
+}
+
+float HashToUnitFloat(uint H)
+{
+	return float(H & 0x00FFFFFFu) / 16777216.0;
+}
