@@ -32,6 +32,23 @@ private:
 	bool bPaintTest = false;
 	int32 PaintTestStage = 0;
 
+	/** -SloshSkelTest: a cylinder pours viscous liquid onto an animated skeletal mesh fitted with bone capsules. */
+	void StartSkelTest();
+	void TickSkelTest();
+
+	bool bSkelTest = false;
+	int32 SkelTestStage = 0;
+
+	UPROPERTY()
+	TObjectPtr<class UPoseableMeshComponent> SkelPose;
+
+	UPROPERTY()
+	TObjectPtr<class USloshSkeletalColliderComponent> SkelColliders;
+
+	FName SkelArmBone;
+	FQuat SkelArmRefCS = FQuat::Identity;
+	FVector SkelSwingAxis = FVector::ForwardVector;
+
 	UPROPERTY()
 	TObjectPtr<AActor> PaintCharacter;
 

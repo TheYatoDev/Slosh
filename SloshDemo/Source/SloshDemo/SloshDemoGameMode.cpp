@@ -26,6 +26,8 @@
 #include "UnrealClient.h"
 #include "EngineUtils.h"
 #include "Materials/MaterialInterface.h"
+#include "Components/PoseableMeshComponent.h"
+#include "SloshSkeletalColliderComponent.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSloshDemo, Log, All);
 
@@ -75,6 +77,11 @@ void ASloshDemoGameMode::StartPlay()
 	if (FParse::Param(FCommandLine::Get(), TEXT("SloshPaintTest")))
 	{
 		StartPaintTest();
+		return;
+	}
+	if (FParse::Param(FCommandLine::Get(), TEXT("SloshSkelTest")))
+	{
+		StartSkelTest();
 		return;
 	}
 
@@ -216,6 +223,11 @@ void ASloshDemoGameMode::Tick(float DeltaSeconds)
 	if (bPaintTest)
 	{
 		TickPaintTest();
+		return;
+	}
+	if (bSkelTest)
+	{
+		TickSkelTest();
 		return;
 	}
 
@@ -524,5 +536,235 @@ void ASloshDemoGameMode::TickPaintTest()
 	if (Elapsed > AutoTestSeconds)
 	{
 		FPlatformMisc::RequestExit(false, TEXT("SloshPaintTest"));
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Skeletal mesh collision test (-SloshSkelTest). A cylinder pours viscous, honey-like liquid onto the
+// shoulder of a skeletal mesh whose bones carry fitted Slosh capsules; the arm swings and the body sways
+// so the colliders move. Optional: -SloshSkelMesh=/Game/Path.Asset  -SloshSkelDebug (draw capsules)
+//   -SloshSkelViscosity=m^2/s
+// ---------------------------------------------------------------------------------------------
+namespace
+{
+	FName FindBone(const FReferenceSkeleton& Ref, std::initializer_list<const TCHAR*> Names)
+	{
+		for (const TCHAR* Name : Names)
+		{
+			if (Ref.FindBoneIndex(Name) != INDEX_NONE)
+			{
+				return FName(Name);
+			}
+		}
+		return NAME_None;
+	}
+}
+
+void ASloshDemoGameMode::StartSkelTest()
+{
+	bSkelTest = true;
+	UWorld* World = GetWorld();
+	const TCHAR* Cmd = FCommandLine::Get();
+	AutoTestSeconds = FMath::Max(AutoTestSeconds, 13.0);
+
+	FString MeshPath = TEXT("/Game/FNIA/Frenni/SKM_FrenniFazclaire.SKM_FrenniFazclaire");
+	FParse::Value(Cmd, TEXT("SloshSkelMesh="), MeshPath);
+	USkeletalMesh* Mesh = LoadObject<USkeletalMesh>(nullptr, *MeshPath);
+	if (!Mesh)
+	{
+		UE_LOG(LogSloshDemo, Error, TEXT("skel test: mesh %s not found"), *MeshPath);
+		FPlatformMisc::RequestExit(false, TEXT("SloshSkelTest"));
+		return;
+	}
+
+	// Poseable mesh: bones are driven directly from Tick, no animation asset needed.
+	AActor* Character = World->SpawnActor<AActor>(FVector::ZeroVector, FRotator::ZeroRotator);
+	SkelPose = NewObject<UPoseableMeshComponent>(Character, TEXT("Pose"));
+	Character->SetRootComponent(SkelPose);
+	SkelPose->SetSkinnedAssetAndUpdate(Mesh);
+	SkelPose->RegisterComponent();
+
+	SkelColliders = NewObject<USloshSkeletalColliderComponent>(Character, TEXT("SloshSkeletalCollider"));
+	SkelColliders->bDrawCapsules = FParse::Param(Cmd, TEXT("SloshSkelDebug"));
+	SkelColliders->SetupAttachment(SkelPose);
+	SkelColliders->RegisterComponent();   // BeginPlay fits the capsules
+	if (SkelColliders->GetColliders().IsEmpty())
+	{
+		SkelColliders->RebuildColliders();
+	}
+	for (USloshColliderComponent* Collider : SkelColliders->GetColliders())
+	{
+		Collider->bReportFeedbackWhenKinematic = true;   // wetness metric
+		Collider->EnterThreshold = 0.02f;
+	}
+
+	// Character frame from the bind pose (component space == world space at the origin).
+	const FReferenceSkeleton& Ref = Mesh->GetRefSkeleton();
+	auto BonePos = [Mesh](FName Bone) { return Bone.IsNone() ? FVector::ZeroVector : FTransform(Mesh->GetComposedRefPoseMatrix(Bone)).GetLocation(); };
+	const FBoxSphereBounds MeshBounds = Mesh->GetBounds();
+	const FName Hips = FindBone(Ref, { TEXT("Hips"), TEXT("pelvis"), TEXT("Pelvis") });
+	const FName Foot = FindBone(Ref, { TEXT("Foot_L"), TEXT("foot_l"), TEXT("LeftFoot") });
+	const FName Toe = FindBone(Ref, { TEXT("Toe_L"), TEXT("ball_l"), TEXT("LeftToeBase") });
+	SkelArmBone = FindBone(Ref, { TEXT("Upperarm_L"), TEXT("upperarm_l"), TEXT("LeftArm") });
+	const FName Forearm = FindBone(Ref, { TEXT("Lowerarm_L"), TEXT("lowerarm_l"), TEXT("LeftForeArm") });
+
+	FVector Forward = (!Foot.IsNone() && !Toe.IsNone()) ? (BonePos(Toe) - BonePos(Foot)) * FVector(1, 1, 0) : FVector(0, -1, 0);
+	Forward = Forward.GetSafeNormal(UE_SMALL_NUMBER, FVector(0, -1, 0));
+	const FVector Up = FVector::UpVector;
+	FVector Target = MeshBounds.Origin + FVector(0, 0, MeshBounds.BoxExtent.Z * 0.55);
+	FVector Side = FVector::CrossProduct(Up, Forward);
+	if (!SkelArmBone.IsNone())
+	{
+		const FVector Shoulder = BonePos(SkelArmBone);
+		const FVector Elbow = Forearm.IsNone() ? Shoulder : BonePos(Forearm);
+		Target = FMath::Lerp(Shoulder, Elbow, 0.25) + Up * 4.0;
+		const FVector Out = (Shoulder - (Hips.IsNone() ? MeshBounds.Origin : BonePos(Hips))) * FVector(1, 1, 0);
+		Side = (Out - FVector::DotProduct(Out, Forward) * Forward).GetSafeNormal(UE_SMALL_NUMBER, Side);
+		SkelArmRefCS = FTransform(Mesh->GetComposedRefPoseMatrix(SkelArmBone)).GetRotation();
+		SkelSwingAxis = Forward;
+	}
+
+	// Nozzle: a pour from just above the shoulder, tilted slightly so the cylinder reads in front of the head.
+	const float Speed = 60.0f;
+	const FVector EmitPos = Target + Up * 38.0 + Forward * 4.0;
+	const FVector Aim = (-Up + Forward * 0.12 + Side * 0.05).GetSafeNormal();
+
+	AStaticMeshActor* Cylinder = World->SpawnActor<AStaticMeshActor>(EmitPos - Aim * 23.0, FRotationMatrix::MakeFromZ(Aim).Rotator());
+	Cylinder->GetStaticMeshComponent()->SetMobility(EComponentMobility::Movable);
+	Cylinder->GetStaticMeshComponent()->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cylinder.Cylinder")));
+	Cylinder->GetStaticMeshComponent()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Cylinder->SetActorScale3D(FVector(0.09, 0.09, 0.4));   // 9 cm wide, 40 cm long; the emitter sits just past its tip
+
+	AActor* EmitterActor = World->SpawnActor<AActor>(EmitPos, Aim.Rotation());
+	USceneComponent* EmitterRoot = NewObject<USceneComponent>(EmitterActor);
+	EmitterActor->SetRootComponent(EmitterRoot);
+	EmitterRoot->RegisterComponent();
+	EmitterActor->SetActorLocationAndRotation(EmitPos, Aim.Rotation());
+	USloshEmitterComponent* Emitter = NewObject<USloshEmitterComponent>(EmitterActor, TEXT("Emitter"));
+	Emitter->SetupAttachment(EmitterRoot);
+	Emitter->Radius = 3.0f;
+	Emitter->ParticlesPerSecond = 2500.0f;   // ~1.2 L/s at 2.5 cm cells (8 particles per cell)
+	Emitter->Speed = Speed;
+	Emitter->RegisterComponent();
+
+	// Domain: the character plus the nozzle, floor at z = 0 (the grid's wall layer sits just below).
+	FBox Domain = MeshBounds.GetBox();
+	Domain += EmitPos;
+	Domain = Domain.ExpandBy(FVector(30, 30, 15));
+	const float Cell = 2.5f;
+	Domain.Min.Z = -Cell;
+	auto Cells = [Cell](double Size) -> int32 { return FMath::DivideAndRoundUp(int32(FMath::CeilToInt(Size / Cell)), 8) * 8; };
+	const FIntVector Res(Cells(Domain.GetSize().X), Cells(Domain.GetSize().Y), Cells(Domain.GetSize().Z));
+	const FVector DomainSize = FVector(Res) * Cell;
+	const FVector DomainCenter(Domain.GetCenter().X, Domain.GetCenter().Y, Domain.Min.Z + DomainSize.Z * 0.5);
+
+	FActorSpawnParameters Deferred;
+	Deferred.bDeferConstruction = true;
+	Volume = World->SpawnActor<ASloshVolume>(DomainCenter, FRotator::ZeroRotator, Deferred);
+	Volume->GridResolution = Res;
+	Volume->CellSize = Cell;
+	Volume->ParticleCapacity = 1 << 20;
+	Volume->bFillOnBeginPlay = false;
+	// Honey-like: dense, very viscous, sticky at solid contact.
+	Volume->Physical.Density = 1400.0f;
+	Volume->Physical.KinematicViscosity = 0.01f;
+	FParse::Value(Cmd, TEXT("SloshSkelViscosity="), Volume->Physical.KinematicViscosity);
+	Volume->Physical.Transfer = ESloshTransfer::APIC;
+	Volume->Physical.BoundaryFriction = 0.9f;
+	Volume->Visual.AbsorptionPerMeter = FVector(6.0, 18.0, 60.0);
+	Volume->Visual.ScatterColor = FLinearColor(0.35f, 0.17f, 0.02f);
+	Volume->Visual.FresnelF0 = 0.04f;
+	Volume->Visual.SpecularPower = 250.0f;
+	UGameplayStatics::FinishSpawningActor(Volume, FTransform(DomainCenter));
+
+	AStaticMeshActor* Floor = World->SpawnActor<AStaticMeshActor>(FVector(DomainCenter.X, DomainCenter.Y, 0), FRotator::ZeroRotator);
+	Floor->GetStaticMeshComponent()->SetMobility(EComponentMobility::Movable);
+	Floor->GetStaticMeshComponent()->SetStaticMesh(LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane")));
+	Floor->GetStaticMeshComponent()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	Floor->SetActorScale3D(FVector(DomainSize.X / 100.0 + 2.0, DomainSize.Y / 100.0 + 2.0, 1.0));
+	if (UMaterialInterface* Dark = LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/SloshTest/M_TestSurface.M_TestSurface")))
+	{
+		Floor->GetStaticMeshComponent()->SetMaterial(0, Dark);
+	}
+
+	const FVector LookAt = Target - Up * 20.0;
+	ACameraActor* Camera = World->SpawnActor<ACameraActor>(LookAt + Forward * 150.0 + Side * 95.0 + Up * 10.0, FRotator::ZeroRotator);
+	Camera->SetActorRotation((LookAt - Camera->GetActorLocation()).Rotation());
+	if (APlayerController* PC = UGameplayStatics::GetPlayerController(World, 0))
+	{
+		PC->SetViewTarget(Camera);
+		if (APawn* Pawn = PC->GetPawn())
+		{
+			Pawn->SetActorHiddenInGame(true);
+			Pawn->SetActorEnableCollision(false);
+		}
+	}
+
+	UE_LOG(LogSloshDemo, Display, TEXT("skel test: mesh %s, %d colliders, forward %s side %s, target %s, nozzle %s aim %s, grid %s (%.1f cm) domain %s"),
+		*Mesh->GetName(), SkelColliders->GetColliders().Num(), *Forward.ToCompactString(), *Side.ToCompactString(), *Target.ToCompactString(),
+		*EmitPos.ToCompactString(), *Aim.ToCompactString(), *Res.ToString(), Cell, *DomainSize.ToCompactString());
+}
+
+void ASloshDemoGameMode::TickSkelTest()
+{
+	// The arm raises and lowers in the frontal plane; the whole body sways a little.
+	if (SkelPose && !SkelArmBone.IsNone())
+	{
+		const double Angle = FMath::DegreesToRadians(22.0) * (0.5 - 0.5 * FMath::Cos(Elapsed * UE_TWO_PI * 0.2));
+		SkelPose->SetBoneRotationByName(SkelArmBone, (FQuat(SkelSwingAxis, -Angle) * SkelArmRefCS).Rotator(), EBoneSpaces::ComponentSpace);
+	}
+	if (SkelPose)
+	{
+		SkelPose->GetOwner()->SetActorRotation(FRotator(0, 6.0 * FMath::Sin(Elapsed * 0.7), 0));
+	}
+	if (Elapsed > 9.0)
+	{
+		for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+		{
+			if (USloshEmitterComponent* Emitter = It->FindComponentByClass<USloshEmitterComponent>())
+			{
+				Emitter->bEmitting = false;   // watch it drip and settle
+			}
+		}
+	}
+
+	FrameTimeAccum += GetWorld()->GetDeltaSeconds();
+	GpuTimeAccum += FPlatformTime::ToMilliseconds(RHIGetGPUFrameCycles());
+	++FrameCount;
+	if (Elapsed >= NextLog && Volume)
+	{
+		NextLog += 1.0;
+		int32 Wet = 0;
+		FString WetBones;
+		if (SkelColliders)
+		{
+			for (const USloshColliderComponent* Collider : SkelColliders->GetColliders())
+			{
+				if (Collider && Collider->GetSubmergedFraction() > 0.0f)
+				{
+					++Wet;
+					WetBones += FString::Printf(TEXT(" %s:%.2f"), *Collider->GetAttachSocketName().ToString(), Collider->GetSubmergedFraction());
+				}
+			}
+		}
+		const double AvgMs = FrameTimeAccum / FMath::Max(FrameCount, 1) * 1000.0;
+		UE_LOG(LogSloshDemo, Display, TEXT("skel t=%.1fs frame=%.2fms gpu=%.2fms particles=%d substeps=%d maxSpeed=%.0fcm/s liquid=%.2fL clamp=%d | wet colliders %d/%d:%s"),
+			Elapsed, AvgMs, GpuTimeAccum / FMath::Max(FrameCount, 1), Volume->GetParticleCount(), Volume->GetLastSubstepCount(), Volume->GetMaxParticleSpeed(),
+			Volume->GetLiquidVolumeLiters(), Volume->GetClampedParticleCount(), Wet, SkelColliders ? SkelColliders->GetColliders().Num() : 0, *WetBones);
+		FrameTimeAccum = 0.0;
+		GpuTimeAccum = 0.0;
+		FrameCount = 0;
+	}
+
+	const FString BenchDir = FPaths::ProjectSavedDir() / TEXT("Bench");
+	const double Shots[] = { 3.0, 6.0, 9.0, 12.5 };
+	if (SkelTestStage < int32(UE_ARRAY_COUNT(Shots)) && Elapsed > Shots[SkelTestStage])
+	{
+		FScreenshotRequest::RequestScreenshot(BenchDir / FString::Printf(TEXT("SkelTest_%c.png"), TCHAR('A' + SkelTestStage)), false, false);
+		++SkelTestStage;
+	}
+	if (bAutoTest && Elapsed > AutoTestSeconds)
+	{
+		FPlatformMisc::RequestExit(false, TEXT("SloshSkelTest"));
 	}
 }
