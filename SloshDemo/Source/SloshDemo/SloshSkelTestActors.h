@@ -97,8 +97,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh Test", meta = (ClampMin = "0.0", Units = "Seconds"))
 	float StopAfter = 9.0f;
 
+	/** Disable continuous pouring (bursts only). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh Test")
+	bool bContinuous = true;
+
+	/** Fire Emitter->Burst(BurstParticles) every this many seconds (0 = no bursts). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh Test", meta = (ClampMin = "0.0", Units = "Seconds"))
+	float BurstInterval = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh Test", meta = (ClampMin = "0"))
+	int32 BurstParticles = 4000;
+
 	virtual void Tick(float DeltaSeconds) override;
 
 private:
 	double Time = 0.0;
+	double NextBurst = 0.0;
 };

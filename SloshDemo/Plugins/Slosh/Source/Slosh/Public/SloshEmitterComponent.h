@@ -107,6 +107,9 @@ public:
 	float PendingBurstLiters = 0.0f;
 	int64 EmittedParticles = 0;
 	FVector PreviousLocation = FVector::ZeroVector;
+	FVector MeasuredVelocity = FVector::ZeroVector;
+	uint64 VelocityFrame = ~0ull;
+	uint64 EmitFrame = ~0ull;
 	bool bHasPreviousLocation = false;
 
 protected:

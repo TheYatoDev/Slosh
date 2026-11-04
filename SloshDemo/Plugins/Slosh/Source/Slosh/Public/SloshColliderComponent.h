@@ -146,6 +146,9 @@ private:
 
 	FTransform PrevTransform;
 	bool bHasPrevTransform = false;
+	uint64 VelocityFrame = ~0ull;
+	FVector CachedLinearVel = FVector::ZeroVector;
+	FVector CachedAngularVel = FVector::ZeroVector;
 
 	FVector PendingForce = FVector::ZeroVector;
 	FVector PendingTorque = FVector::ZeroVector;

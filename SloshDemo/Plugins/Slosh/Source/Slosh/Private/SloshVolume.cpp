@@ -325,14 +325,22 @@ void ASloshVolume::Tick(float DeltaSeconds)
 				continue;
 			}
 			const FVector Location = Emitter->GetComponentLocation();
-			const FVector EmitterVelocity = Emitter->bHasPreviousLocation && DeltaSeconds > UE_KINDA_SMALL_NUMBER
-				? (Location - Emitter->PreviousLocation) / DeltaSeconds : FVector::ZeroVector;
-			Emitter->PreviousLocation = Location;
-			Emitter->bHasPreviousLocation = true;
-			if (!ContainsPoint(Location))
+			// Motion is measured once per game frame (every volume ticks over every emitter), and an emitter feeds
+			// only the first volume that contains it, even where volumes overlap.
+			if (Emitter->VelocityFrame != GFrameCounter)
+			{
+				Emitter->VelocityFrame = GFrameCounter;
+				Emitter->MeasuredVelocity = Emitter->bHasPreviousLocation && DeltaSeconds > UE_KINDA_SMALL_NUMBER
+					? (Location - Emitter->PreviousLocation) / DeltaSeconds : FVector::ZeroVector;
+				Emitter->PreviousLocation = Location;
+				Emitter->bHasPreviousLocation = true;
+			}
+			const FVector EmitterVelocity = Emitter->MeasuredVelocity;
+			if (Emitter->EmitFrame == GFrameCounter || !ContainsPoint(Location))
 			{
 				continue;
 			}
+			Emitter->EmitFrame = GFrameCounter;
 			int64 Count = 0;
 			if (Emitter->bEmitting)
 			{

@@ -103,6 +103,17 @@ void ASloshDemoGameMode::StartPlay()
 		StartSkelTest();
 		return;
 	}
+	// A level without a volume that is tagged as a showcase (e.g. the Slosh Paint showcase) is also used as-is.
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		if (It->ActorHasTag(TEXT("SloshShowcase")) && !TActorIterator<ASloshVolume>(World))
+		{
+			bPlacedScene = true;
+			AutoTestSeconds = FMath::Max(AutoTestSeconds, 13.0);
+			UE_LOG(LogSloshDemo, Display, TEXT("placed scene: showcase level without a liquid volume; demo scene not spawned"));
+			return;
+		}
+	}
 	for (TActorIterator<ASloshVolume> It(World); It; ++It)
 	{
 		Volume = *It;
@@ -712,7 +723,7 @@ void ASloshDemoGameMode::StartSkelTest()
 	USloshEmitterComponent* Emitter = NewObject<USloshEmitterComponent>(EmitterActor, TEXT("Emitter"));
 	Emitter->SetupAttachment(EmitterRoot);
 	Emitter->Radius = 3.0f;
-	Emitter->ParticlesPerSecond = 2500.0f;   // ~1.2 L/s at 2.5 cm cells (8 particles per cell)
+	Emitter->ParticlesPerSecond = 2500.0f;   // ~4.9 L/s at 2.5 cm cells (8 particles per cell)
 	Emitter->Speed = Speed;
 	Emitter->RegisterComponent();
 

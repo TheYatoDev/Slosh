@@ -78,28 +78,36 @@ FSloshColliderGPU USloshColliderComponent::BuildGPUCollider(const FTransform& Wo
 	const float Scale = World.GetScale3D().GetAbsMax();
 	const float ToMeters = WorldToSim.GetScale3D().X;
 
-	FVector LinearVel = FVector::ZeroVector;
-	FVector AngularVel = FVector::ZeroVector;
-	if (UPrimitiveComponent* Body = GetSimulatedBody())
+	// Velocity is computed once per game frame: a collider in reach of several volumes is built by each of them,
+	// and a second finite difference against the transform the first call just stored would read zero.
+	if (VelocityFrame != GFrameCounter)
 	{
-		LinearVel = Body->GetPhysicsLinearVelocity();
-		AngularVel = Body->GetPhysicsAngularVelocityInRadians();
-		// Velocity of this component's origin, which may be offset from the body's COM.
-		LinearVel += FVector::CrossProduct(AngularVel, World.GetLocation() - Body->GetCenterOfMass());
+		VelocityFrame = GFrameCounter;
+		CachedLinearVel = FVector::ZeroVector;
+		CachedAngularVel = FVector::ZeroVector;
+		if (UPrimitiveComponent* Body = GetSimulatedBody())
+		{
+			CachedLinearVel = Body->GetPhysicsLinearVelocity();
+			CachedAngularVel = Body->GetPhysicsAngularVelocityInRadians();
+			// Velocity of this component's origin, which may be offset from the body's COM.
+			CachedLinearVel += FVector::CrossProduct(CachedAngularVel, World.GetLocation() - Body->GetCenterOfMass());
+		}
+		else if (bHasPrevTransform && DeltaTime > UE_KINDA_SMALL_NUMBER)
+		{
+			// Kinematic / animated: finite-difference the transform.
+			CachedLinearVel = (World.GetLocation() - PrevTransform.GetLocation()) / DeltaTime;
+			const FQuat Delta = World.GetRotation() * PrevTransform.GetRotation().Inverse();
+			FVector Axis;
+			float Angle;
+			Delta.ToAxisAndAngle(Axis, Angle);
+			Angle = FMath::UnwindRadians(Angle);
+			CachedAngularVel = Axis * (Angle / DeltaTime);
+		}
+		PrevTransform = World;
+		bHasPrevTransform = true;
 	}
-	else if (bHasPrevTransform && DeltaTime > UE_KINDA_SMALL_NUMBER)
-	{
-		// Kinematic / animated: finite-difference the transform.
-		LinearVel = (World.GetLocation() - PrevTransform.GetLocation()) / DeltaTime;
-		const FQuat Delta = World.GetRotation() * PrevTransform.GetRotation().Inverse();
-		FVector Axis;
-		float Angle;
-		Delta.ToAxisAndAngle(Axis, Angle);
-		Angle = FMath::UnwindRadians(Angle);
-		AngularVel = Axis * (Angle / DeltaTime);
-	}
-	PrevTransform = World;
-	bHasPrevTransform = true;
+	const FVector LinearVel = CachedLinearVel;
+	const FVector AngularVel = CachedAngularVel;
 
 	FSloshColliderGPU Out;
 	Out.Center = FVector3f(WorldToSim.TransformPosition(World.GetLocation()));

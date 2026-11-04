@@ -28,10 +28,6 @@ enum class ESloshSurfaceMode : uint8
 	Mesh,
 };
 
-/**
- * A box-shaped liquid simulation domain (dense MAC grid, GPU FLIP/APIC).
- * The actor location is the domain center; rotation orients the grid; actor scale is ignored.
- */
 UENUM(BlueprintType)
 enum class ESloshPressureSolverType : uint8
 {
@@ -43,6 +39,10 @@ enum class ESloshPressureSolverType : uint8
 	RBGS,
 };
 
+/**
+ * A box-shaped liquid simulation domain (dense MAC grid, GPU FLIP/APIC).
+ * The actor location is the domain center; rotation orients the grid; actor scale is ignored.
+ */
 UCLASS(BlueprintType, Blueprintable)
 class SLOSH_API ASloshVolume : public AActor
 {

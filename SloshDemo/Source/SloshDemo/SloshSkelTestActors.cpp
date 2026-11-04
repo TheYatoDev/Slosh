@@ -79,7 +79,7 @@ ASloshPourNozzle::ASloshPourNozzle()
 
 	Emitter = CreateDefaultSubobject<USloshEmitterComponent>(TEXT("Emitter"));
 	Emitter->Radius = 3.0f;
-	Emitter->ParticlesPerSecond = 2500.0f;   // ~1.2 L/s at 2.5 cm cells (8 particles per cell)
+	Emitter->ParticlesPerSecond = 2500.0f;   // ~4.9 L/s at 2.5 cm cells (8 particles per cell)
 	Emitter->Speed = 60.0f;
 	RootComponent = Emitter;
 
@@ -98,5 +98,11 @@ void ASloshPourNozzle::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 	Time += DeltaSeconds;
-	Emitter->bEmitting = Time >= StartDelay && (StopAfter <= 0.0f || Time < StopAfter);
+	const bool bActive = Time >= StartDelay && (StopAfter <= 0.0f || Time < StopAfter);
+	Emitter->bEmitting = bActive && bContinuous;
+	if (bActive && BurstInterval > 0.0f && Time >= NextBurst)
+	{
+		Emitter->Burst(BurstParticles);
+		NextBurst = Time + BurstInterval;
+	}
 }

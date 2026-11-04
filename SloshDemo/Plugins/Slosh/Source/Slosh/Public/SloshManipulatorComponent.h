@@ -75,8 +75,8 @@ class SLOSH_API USloshDrainComponent : public USloshManipulatorComponent
 	GENERATED_BODY()
 
 public:
-	/** Particles removed per second as a rate (each particle inside leaves with probability 1 - exp(-rate dt)).
-	 *  0 removes everything inside at once. */
+	/** Per-particle removal rate, 1/s: each particle inside leaves with probability 1 - exp(-rate dt) per substep
+	 *  (2 = roughly 86% of the liquid inside gone within a second). 0 removes everything inside at once. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh", meta = (ClampMin = "0.0"))
 	float RemovalRate = 0.0f;
 
