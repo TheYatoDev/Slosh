@@ -5,6 +5,8 @@
 #define SLOSH_SIM_USF "/Plugin/Slosh/Private/Slosh.usf"
 
 IMPLEMENT_GLOBAL_SHADER(FSloshEmitParticlesCS, SLOSH_SIM_USF, "EmitParticlesCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSloshEmitReserveCS, SLOSH_SIM_USF, "EmitReserveCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSloshAccumulateStatsCS, SLOSH_SIM_USF, "AccumulateStatsCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSloshBuildSolidCS, SLOSH_SIM_USF, "BuildSolidCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSloshP2GCS, SLOSH_SIM_USF, "P2GCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSloshMarkCellsCS, SLOSH_SIM_USF, "MarkCellsCS", SF_Compute);
@@ -44,3 +46,4 @@ IMPLEMENT_GLOBAL_SHADER(FSloshSortCountCS, SLOSH_SORT_USF, "SortCountCS", SF_Com
 IMPLEMENT_GLOBAL_SHADER(FSloshSortScanBlocksCS, SLOSH_SORT_USF, "SortScanBlocksCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSloshSortScanBlockSumsCS, SLOSH_SORT_USF, "SortScanBlockSumsCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSloshSortScatterCS, SLOSH_SORT_USF, "SortScatterCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FSloshSortWriteCountCS, SLOSH_SORT_USF, "SortWriteCountCS", SF_Compute);

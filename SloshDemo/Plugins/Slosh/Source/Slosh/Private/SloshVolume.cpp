@@ -3,8 +3,12 @@
 #include "SloshVolume.h"
 #include "SloshColliderComponent.h"
 #include "SloshEmitterComponent.h"
+#include "SloshManipulatorComponent.h"
 #include "SloshSubsystem.h"
 #include "SloshRenderer.h"
+#include "SloshSurfaceMesh.h"
+#include "SloshSurfaceMeshComponent.h"
+#include "SloshPaintPreset.h"
 #include "Components/BoxComponent.h"
 #include "Components/LightComponent.h"
 #include "Engine/DirectionalLight.h"
@@ -82,6 +86,8 @@ FSloshSolverSettings ASloshVolume::BuildSolverSettings() const
 	S.Density = Phys.Density;
 	S.KinematicViscosity = Phys.KinematicViscosity;
 	S.BoundaryFriction = Phys.BoundaryFriction;
+	S.Adhesion = Phys.Adhesion;
+	S.AdhesionDistance = Phys.AdhesionDistance * 0.01f;
 	S.DensityCorrection = Phys.DensityCorrection;
 	const int64 Cells = int64(GridResolution.X) * GridResolution.Y * GridResolution.Z;
 	const bool bUseMG = PressureSolver == ESloshPressureSolverType::MGPCG
@@ -162,6 +168,19 @@ void ASloshVolume::EmitSphere(FVector WorldCenter, float Radius, FVector WorldVe
 	TotalEmittedGameThread += Count;
 }
 
+UMaterialInterface* ASloshVolume::GetEffectiveSurfaceMaterial() const
+{
+	if (SurfaceMaterial)
+	{
+		return SurfaceMaterial;
+	}
+	if (const USloshPaintPreset* Preset = Cast<USloshPaintPreset>(Material))
+	{
+		return Preset->Material;
+	}
+	return nullptr;
+}
+
 void ASloshVolume::ResetSimulation()
 {
 	bPendingReset = true;
@@ -193,6 +212,12 @@ void ASloshVolume::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	{
 		Subsystem->UnregisterVolume(this);
 	}
+	if (SurfaceMeshComponent)
+	{
+		SurfaceMeshComponent->DestroyComponent();
+		SurfaceMeshComponent = nullptr;
+	}
+	SurfaceMeshBuffers.Reset();
 	if (Proxy.IsValid())
 	{
 		SloshRender::RemoveVolume_GameThread(Proxy.Get());
@@ -219,6 +244,43 @@ void ASloshVolume::UpdateRenderRegistration()
 	Settings.SpecularPower = Vis.SpecularPower;
 	Settings.ParticleRadiusScale = Vis.ParticleRadiusScale;
 	Settings.SmoothingRadius = Vis.SmoothingRadius;
+	Settings.SmoothingScale = Vis.SmoothingScale;
+	Settings.SmoothingIterations = Vis.SmoothingIterations;
+	Settings.EdgeFadeThickness = Vis.EdgeFadeThickness;
+	Settings.ScatterLighting = Vis.ScatterLighting;
+	Settings.Anisotropy = Vis.Anisotropy;
+	Settings.AnisotropyMaxStretch = Vis.AnisotropyMaxStretch;
+	Settings.AnisotropySmoothing = Vis.AnisotropySmoothing;
+	Settings.SurfaceMode = SurfaceMode == ESloshSurfaceMode::Raymarched ? ESloshSurfaceRenderMode::Raymarch
+		: SurfaceMode == ESloshSurfaceMode::Mesh ? ESloshSurfaceRenderMode::Mesh : ESloshSurfaceRenderMode::Splats;
+	Settings.FieldResolution = FieldResolution;
+	Settings.SurfaceSmoothing = SurfaceSmoothing;
+	Settings.IsoLevel = SurfaceIsoLevel;
+	Settings.LocalOffsetCm = FVector3f(-GetDomainSize() * 0.5);
+
+	// Mesh mode: a surface mesh component sharing GPU buffers with the renderer, created on demand.
+	if (SurfaceMode == ESloshSurfaceMode::Mesh && bRenderLiquid)
+	{
+		const uint32 Capacity = uint32(FMath::Max(MaxSurfaceVertices, 1024));
+		if (!SurfaceMeshBuffers.IsValid() || SurfaceMeshBuffers->GetMaxVertices() != FMath::Clamp<uint32>(Capacity, 1024u, 8u * 1024u * 1024u))
+		{
+			SurfaceMeshBuffers = FSloshSurfaceMeshBuffers::Create(Capacity);
+		}
+		if (!SurfaceMeshComponent)
+		{
+			SurfaceMeshComponent = NewObject<USloshSurfaceMeshComponent>(this, TEXT("SloshSurfaceMesh"));
+			SurfaceMeshComponent->SetupAttachment(Bounds);
+			SurfaceMeshComponent->RegisterComponent();
+		}
+		SurfaceMeshComponent->Configure(SurfaceMeshBuffers, GetDomainSize() * 0.5, GetEffectiveSurfaceMaterial());
+		Settings.MeshBuffers = SurfaceMeshBuffers;
+	}
+	else if (SurfaceMeshComponent)
+	{
+		SurfaceMeshComponent->DestroyComponent();
+		SurfaceMeshComponent = nullptr;
+		SurfaceMeshBuffers.Reset();
+	}
 
 	if (!SunLight)
 	{
@@ -250,25 +312,100 @@ void ASloshVolume::Tick(float DeltaSeconds)
 	const FTransform SimToWorld = GetSimToWorld();
 	const FTransform WorldToSim = SimToWorld.Inverse();
 
-	// Continuous emitters inside the domain.
+	// Emitters inside the domain: continuous rate, bursts, lifetime limit, spread and inherited motion.
 	if (Subsystem && bSimulate)
 	{
+		const double CellM = CellSize * 0.01;
+		const double ParticlesPerLiter = 8.0 / (CellM * CellM * CellM * 1000.0);
 		for (const TWeakObjectPtr<USloshEmitterComponent>& WeakEmitter : Subsystem->GetEmitters())
 		{
 			USloshEmitterComponent* Emitter = WeakEmitter.Get();
-			if (!Emitter || !Emitter->bEmitting || !ContainsPoint(Emitter->GetComponentLocation()))
+			if (!Emitter)
 			{
 				continue;
 			}
-			Emitter->Carry += Emitter->ParticlesPerSecond * DeltaSeconds;
-			const int32 Count = FMath::FloorToInt(Emitter->Carry);
-			Emitter->Carry -= Count;
-			EmitSphere(Emitter->GetComponentLocation(), Emitter->Radius, Emitter->GetForwardVector() * Emitter->Speed, Count);
+			const FVector Location = Emitter->GetComponentLocation();
+			// Motion is measured once per game frame (every volume ticks over every emitter), and an emitter feeds
+			// only the first volume that contains it, even where volumes overlap.
+			if (Emitter->VelocityFrame != GFrameCounter)
+			{
+				Emitter->VelocityFrame = GFrameCounter;
+				Emitter->MeasuredVelocity = Emitter->bHasPreviousLocation && DeltaSeconds > UE_KINDA_SMALL_NUMBER
+					? (Location - Emitter->PreviousLocation) / DeltaSeconds : FVector::ZeroVector;
+				Emitter->PreviousLocation = Location;
+				Emitter->bHasPreviousLocation = true;
+			}
+			const FVector EmitterVelocity = Emitter->MeasuredVelocity;
+			if (Emitter->EmitFrame == GFrameCounter || !ContainsPoint(Location))
+			{
+				continue;
+			}
+			Emitter->EmitFrame = GFrameCounter;
+			int64 Count = 0;
+			if (Emitter->bEmitting)
+			{
+				const double Rate = Emitter->RateMode == ESloshEmitRateMode::LitersPerSecond
+					? double(Emitter->LitersPerSecond) * ParticlesPerLiter : double(Emitter->ParticlesPerSecond);
+				Emitter->Carry += float(Rate * DeltaSeconds);
+				Count = FMath::FloorToInt64(Emitter->Carry);
+				Emitter->Carry -= float(Count);
+			}
+			Count += Emitter->PendingBurst + FMath::RoundToInt64(double(Emitter->PendingBurstLiters) * ParticlesPerLiter);
+			Emitter->PendingBurst = 0;
+			Emitter->PendingBurstLiters = 0.0f;
+			if (Emitter->MaxParticles > 0)
+			{
+				Count = FMath::Min<int64>(Count, FMath::Max<int64>(int64(Emitter->MaxParticles) - Emitter->EmittedParticles, 0));
+			}
+			if (Count <= 0)
+			{
+				continue;
+			}
+			const FTransform EmitterTransform = Emitter->GetComponentTransform();
+			const float Scale = EmitterTransform.GetScale3D().GetAbsMax();
+			const FVector Velocity = Emitter->GetForwardVector() * Emitter->Speed + (Emitter->bInheritVelocity ? EmitterVelocity : FVector::ZeroVector);
+			FSloshEmitRequest Emit;
+			Emit.Center = FVector3f(WorldToSim.TransformPosition(Location));
+			Emit.Velocity = FVector3f(WorldToSim.TransformVector(Velocity));
+			if (Emitter->Shape == ESloshEmitterShape::Box)
+			{
+				const FQuat SimRot = WorldToSim.GetRotation() * EmitterTransform.GetRotation();
+				Emit.Shape = ESloshEmitShape::Box;
+				Emit.Extent = FVector3f(Emitter->BoxExtent * Scale * 0.01);
+				Emit.Rotation = FVector4f(SimRot.X, SimRot.Y, SimRot.Z, SimRot.W);
+			}
+			else
+			{
+				Emit.Shape = ESloshEmitShape::Sphere;
+				Emit.Extent = FVector3f(Emitter->Radius * Scale * 0.01f, 0.0f, 0.0f);
+			}
+			Emit.VelocitySpread = FMath::DegreesToRadians(Emitter->VelocitySpread);
+			Emit.SpeedJitter = Emitter->SpeedVariation;
+			Emit.Count = uint32(FMath::Min<int64>(Count, MAX_int32));
+			PendingEmits.Add(Emit);
+			TotalEmittedGameThread += Emit.Count;
+			Emitter->EmittedParticles += Emit.Count;
 		}
 	}
 
 	FSloshFrameInput Input;
 	Input.Settings = BuildSolverSettings();
+	// Drains and force fields overlapping the domain.
+	if (Subsystem)
+	{
+		const FBox ManipulatorBox = GetComponentsBoundingBox(true);
+		for (const TWeakObjectPtr<USloshManipulatorComponent>& WeakManipulator : Subsystem->GetManipulators())
+		{
+			const USloshManipulatorComponent* Manipulator = WeakManipulator.Get();
+			FSloshManipulatorGPU GPU;
+			if (Manipulator && Input.Manipulators.Num() < int32(Slosh::MaxManipulators)
+				&& ManipulatorBox.ExpandBy(Manipulator->GetReach()).IsInside(Manipulator->GetComponentLocation())
+				&& Manipulator->BuildGPU(WorldToSim, GPU))
+			{
+				Input.Manipulators.Add(GPU);
+			}
+		}
+	}
 	Input.SimToWorld = SimToWorld;
 	Input.DeltaTime = DeltaSeconds;
 	Input.bReset = bPendingReset;

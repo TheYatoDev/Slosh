@@ -20,6 +20,9 @@ public class Slosh : ModuleRules
 		{
 			"SloshRender",
 			"PhysicsCore",
+			"GeometryCore",        // Slosh Paint: dynamic mesh + marching cubes
+			"GeometryFramework",   // Slosh Paint: UDynamicMeshComponent
+			"InputCore",           // painter actor key bindings
 			"RenderCore",
 			"RHI",
 		});

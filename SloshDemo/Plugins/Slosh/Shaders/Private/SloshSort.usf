@@ -26,16 +26,24 @@ RWStructuredBuffer<uint> SortRank;
 RWStructuredBuffer<uint> SortCounts;
 RWStructuredBuffer<uint> SortOffsets;
 RWStructuredBuffer<uint> ScanBlockSums;
+RWStructuredBuffer<uint> ParticleCount;   // [0] = live count after compaction
 
 groupshared uint ScanShared[SCAN_THREADS];
 
 // One key per 4^3 brick: groups of 128 sorted particles stay within one or two bricks, which is all the 8^3
 // P2G tile needs, and the count/offset arrays are 64x smaller than per-cell keys.
+// The last key collects removed particles, so the sort also compacts: live particles first, dead ones last.
+uint SortKey(float3 Pos);
+uint SortKeyOf(FSloshParticlePacked P)
+{
+	return IsDeadParticleAge(P.Age) ? NumSortKeys - 1u : SortKey(P.Pos);
+}
+
 uint SortKey(float3 Pos)
 {
 	int3 C = clamp(int3(floor(Pos * InvCellSize)), 0, GridDim - 1);
 	int3 B = C >> 2;
-	return uint(B.x + BrickDim.x * (B.y + BrickDim.y * B.z));
+	return min(uint(B.x + BrickDim.x * (B.y + BrickDim.y * B.z)), NumSortKeys - 2u);
 }
 
 // Inclusive Hillis-Steele scan of one value per thread over the group.
@@ -63,7 +71,7 @@ void SortCountCS(uint3 DTid : SV_DispatchThreadID)
 		return;
 	}
 	uint Rank;
-	InterlockedAdd(SortCounts[SortKey(Particles[I].Pos)], 1u, Rank);
+	InterlockedAdd(SortCounts[SortKeyOf(Particles[I])], 1u, Rank);
 	SortRank[I] = Rank;
 }
 
@@ -132,7 +140,15 @@ void SortScatterCS(uint3 DTid : SV_DispatchThreadID)
 		return;
 	}
 	FSloshParticlePacked P = Particles[I];
-	uint Key = SortKey(P.Pos);
+	uint Key = SortKeyOf(P);
 	uint Dst = SortOffsets[Key] + ScanBlockSums[Key / SCAN_BLOCK] + SortRank[I];
 	ParticlesOut[Dst] = P;
+}
+
+// Live count = start of the dead key's range.
+[numthreads(1, 1, 1)]
+void SortWriteCountCS()
+{
+	uint Dead = NumSortKeys - 1u;
+	ParticleCount[0] = SortOffsets[Dead] + ScanBlockSums[Dead / SCAN_BLOCK];
 }

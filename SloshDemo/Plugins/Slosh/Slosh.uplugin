@@ -3,10 +3,10 @@
 	"Version": 1,
 	"VersionName": "0.1.0",
 	"FriendlyName": "Slosh (GPU FLIP/APIC)",
-	"Description": "Experimental GPU-native FLIP/APIC liquid simulation with analytic rigid-body coupling and screen-space fluid rendering. Phase 1 prototype.",
+	"Description": "Experimental GPU-native FLIP/APIC liquid simulation with analytic rigid-body coupling and screen-space fluid rendering, plus Slosh Paint: Fluid Painter-style liquid strokes painted onto static and skeletal surfaces.",
 	"Category": "Physics",
 	"CreatedBy": "",
-	"CanContainContent": false,
+	"CanContainContent": true,
 	"IsBetaVersion": false,
 	"IsExperimentalVersion": true,
 	"Installed": false,
@@ -24,6 +24,11 @@
 		{
 			"Name": "Slosh",
 			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "SloshEditor",
+			"Type": "Editor",
 			"LoadingPhase": "Default"
 		}
 	]

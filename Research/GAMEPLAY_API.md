@@ -50,6 +50,29 @@ and `CouplingMode != OneWay`, delayed GPU feedback becomes forces.
 ### `USloshSubsystem` (world subsystem) [Impl]
 Registry; `FindVolumeAt(WorldLocation)` (synchronous).
 
+### Slosh Paint [Impl] — `Source/Slosh/Public/SloshPaint*.h`, `SloshPainterActor.h` (design: PAINTER_DESIGN.md)
+- `USloshPaintComponent` (scene component, attached to the painted primitive):
+  - `Strokes` (saved).
+  - `Reveal` and `DropTime` (Interp, Sequencer-keyable); `bAnimateDrops`, `DropTimeScale`.
+  - `UnitScale`, `QualityScale`.
+  - `OnPaintBuilt`.
+  - Functions: `FindOrAddPaintComponent(Target)`, `BeginStroke` / `AddStrokePoint` / `EndStroke` / `AddStroke`,
+    `RemoveStroke`, `UndoLastStroke`, `ClearStrokes`, `Rebuild`, `IsBuilding`.
+  - Rebuilds run on a worker task, at most one in flight. Unchanged strokes are reused from a per-stroke cache.
+- `USloshPaintLibrary`:
+  - `TracePaintSurface(Start, End, Channel, Ignore, bIncludeSkinnedWithoutCollision)` → `FSloshPaintHit`
+    {Location, Normal, Component, Bone}. It refines skeletal hits onto the CPU-skinned render surface.
+  - `TraceSkinnedSurface`, `PaintDab`.
+- `USloshPaintBrushComponent`:
+  - Aim: `ComponentForward`, `MouseCursor` or `ScreenCenter`.
+  - `Preset`, `Pressure`, `Spacing` (0 = auto), `MaxDistance`, `TraceChannel`.
+  - `StartPainting`, `StopPainting`, `PaintAlongRay`; `OnStrokeStarted` / `OnStrokeFinished`.
+- `ASloshPainterActor`: base of `BP_SloshPainter`, `BP_SloshPainter_NSFW` and `BP_SloshNozzle`.
+  - `Presets`, `bMouseInput`, `bAutoPaint`, `PressureStep`.
+  - `SelectPreset`, `NextPreset`, `UndoLastStroke`.
+- `USloshPaintPreset` (data asset): Fluid Painter inputs 1:1 (Scale, Thickness, Quality, Roughness, Flatness, Offset,
+  Fading, Drops, two layers), plus Material, SmoothIterations and bCastShadows. `bAdultContent` flags NSFW presets.
+
 ## 2. Query classification
 
 | Question | Answer path | Sync? | Accuracy |
