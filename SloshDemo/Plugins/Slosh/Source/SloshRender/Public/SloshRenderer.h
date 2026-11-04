@@ -32,11 +32,12 @@ struct FSloshRenderSettings
 	float FresnelF0 = 0.02f;
 	float SpecularPower = 400.0f;
 	float ParticleRadiusScale = 0.6f;
-	int32 SmoothingRadius = 24;
-	float SmoothingScale = 4.0f;
-	int32 SmoothingIterations = 3;
-	float EdgeFadeThickness = 1.5f;
-	float Anisotropy = 0.85f;            // 0 = sphere splats
+	int32 SmoothingRadius = 7;
+	float SmoothingScale = 0.0f;         // > 0: adaptive (depth-scaled, tilt-aware) smoothing + thickness blur
+	int32 SmoothingIterations = 1;
+	float EdgeFadeThickness = 0.0f;
+	float ScatterLighting = 0.0f;
+	float Anisotropy = 0.0f;             // 0 = sphere splats
 	float AnisotropyMaxStretch = 4.0f;
 	float AnisotropySmoothing = 0.5f;
 	ESloshSurfaceRenderMode SurfaceMode = ESloshSurfaceRenderMode::Splats;

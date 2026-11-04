@@ -37,6 +37,7 @@ int2   FilterDirection;
 int    FilterRadius;      // pixel cap
 float  RadiusPerViewZ;    // > 0: radius = RadiusPerViewZ / viewZ pixels (world-constant footprint)
 float  DepthFalloff;      // <= 0: plain Gaussian (thickness)
+uint   bSlopeAware;       // 1: range weight against the local plane (adaptive smoothing)
 
 // Composite
 Texture2D<float> FluidDepth;
@@ -53,6 +54,7 @@ float  RefractionStrength;
 float  SpecularPower;
 float  FresnelF0;
 float  EdgeFadeThickness;   // cm; thinner liquid fades into the scene
+float  ScatterLighting;     // 0 = flat scatter colour, 1 = wrapped-diffuse lit
 uint   bHasFluidNormal;     // 1: use FluidNormal (ray-marched surface) instead of depth-derived normals
 Texture2D<float4> FluidNormal;
 
@@ -479,7 +481,7 @@ void SmoothDepthCS(uint3 DTid : SV_DispatchThreadID)
 	// plane instead, and average the plane-corrected depths. Monotone neighbourhoods give a slope; peaks and
 	// valleys (bumps, real edges) give zero, so silhouettes still stop the filter.
 	float Slope = 0.0;
-	if (DepthFalloff > 0.0)
+	if (DepthFalloff > 0.0 && bSlopeAware != 0u)
 	{
 		float Zm = GuideDepth.Load(int3(clamp(Pixel - FilterDirection * 2, ViewRectMin, ViewRectMin + ViewSize - 1), 0));
 		float Zp = GuideDepth.Load(int3(clamp(Pixel + FilterDirection * 2, ViewRectMin, ViewRectMin + ViewSize - 1), 0));
@@ -576,7 +578,7 @@ void CompositeCS(uint3 DTid : SV_DispatchThreadID)
 	// In-scattered colour is lit with a wrapped diffuse term so thick (opaque) liquids keep their shape
 	// instead of reading as flat colour.
 	float Wrap = saturate(dot(N, -LightDirectionView) * 0.5 + 0.5);
-	float3 ScatterLit = ScatterColor * (0.4 + 0.6 * Wrap * Wrap);
+	float3 ScatterLit = ScatterColor * lerp(1.0, 0.4 + 0.6 * Wrap * Wrap, ScatterLighting);
 	float3 Refracted = Behind * Transmittance + ScatterLit * (1.0 - Transmittance);
 
 	float3 R = reflect(-V, N);

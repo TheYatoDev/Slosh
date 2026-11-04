@@ -364,6 +364,7 @@ namespace
 			P->FilterDirection = Direction;
 			P->FilterRadius = MaxRadius;
 			P->RadiusPerViewZ = RadiusPerViewZ;
+			P->bSlopeAware = Settings.SmoothingScale > 0.0f ? 1u : 0u;
 			P->DepthFalloff = Falloff;
 			P->DepthIn = In;
 			P->GuideDepth = Guide;
@@ -380,10 +381,13 @@ namespace
 					Swap(Src, Dst);
 				}
 			}
-			// Thickness drives the colour: blur it too so single splats do not show as darker spots.
+			// Adaptive mode only: thickness drives the colour, so blur it too and single splats do not show as spots.
+			if (Settings.SmoothingScale > 0.0f)
+			{
 			FRDGTextureRef ThicknessTmp = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(Extent, PF_R32_FLOAT, FClearValueBinding::None, Flags), TEXT("Slosh.ThicknessTmp"));
 			AddSmooth(Thickness, Src, ThicknessTmp, Directions[0], 0.0f);
 			AddSmooth(ThicknessTmp, Src, Thickness, Directions[1], 0.0f);
+			}
 		}
 		}
 		{
@@ -400,6 +404,7 @@ namespace
 			P->SpecularPower = Settings.SpecularPower;
 			P->FresnelF0 = Settings.FresnelF0;
 			P->EdgeFadeThickness = Settings.EdgeFadeThickness;
+			P->ScatterLighting = FMath::Clamp(Settings.ScatterLighting, 0.0f, 1.0f);
 			if (!Normals)
 			{
 				Normals = GraphBuilder.CreateTexture(FRDGTextureDesc::Create2D(FIntPoint(1, 1), PF_FloatRGBA, FClearValueBinding::None, Flags), TEXT("Slosh.NoNormal"));

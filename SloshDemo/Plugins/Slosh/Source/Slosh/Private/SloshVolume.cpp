@@ -247,6 +247,7 @@ void ASloshVolume::UpdateRenderRegistration()
 	Settings.SmoothingScale = Vis.SmoothingScale;
 	Settings.SmoothingIterations = Vis.SmoothingIterations;
 	Settings.EdgeFadeThickness = Vis.EdgeFadeThickness;
+	Settings.ScatterLighting = Vis.ScatterLighting;
 	Settings.Anisotropy = Vis.Anisotropy;
 	Settings.AnisotropyMaxStretch = Vis.AnisotropyMaxStretch;
 	Settings.AnisotropySmoothing = Vis.AnisotropySmoothing;

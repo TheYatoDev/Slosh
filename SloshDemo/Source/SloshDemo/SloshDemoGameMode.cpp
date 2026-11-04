@@ -862,9 +862,9 @@ void ASloshDemoGameMode::TickPlacedScene()
 			Wet += FString::Printf(TEXT(" | %s wet %d/%d:%s"), *It->GetActorNameOrLabel(), Count, It->SloshCollider->GetColliders().Num(), *Bones);
 		}
 		const double AvgMs = FrameTimeAccum / FMath::Max(FrameCount, 1) * 1000.0;
-		UE_LOG(LogSloshDemo, Display, TEXT("placed t=%.1fs frame=%.2fms gpu=%.2fms particles=%d substeps=%d maxSpeed=%.0fcm/s liquid=%.2fL clamp=%d%s"),
-			Elapsed, AvgMs, GpuTimeAccum / FMath::Max(FrameCount, 1), Volume->GetParticleCount(), Volume->GetLastSubstepCount(), Volume->GetMaxParticleSpeed(),
-			Volume->GetLiquidVolumeLiters(), Volume->GetClampedParticleCount(), *Wet);
+		UE_LOG(LogSloshDemo, Display, TEXT("placed t=%.1fs frame=%.2fms gpu=%.2fms particles=%d drained=%lld substeps=%d maxSpeed=%.0fcm/s liquid=%.2fL clamp=%d%s"),
+			Elapsed, AvgMs, GpuTimeAccum / FMath::Max(FrameCount, 1), Volume->GetParticleCount(), Volume->GetDrainedParticleCount(), Volume->GetLastSubstepCount(),
+			Volume->GetMaxParticleSpeed(), Volume->GetLiquidVolumeLiters(), Volume->GetClampedParticleCount(), *Wet);
 		FrameTimeAccum = 0.0;
 		GpuTimeAccum = 0.0;
 		FrameCount = 0;

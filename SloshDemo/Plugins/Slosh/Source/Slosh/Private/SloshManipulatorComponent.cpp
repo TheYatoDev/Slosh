@@ -9,6 +9,7 @@ USloshManipulatorComponent::USloshManipulatorComponent()
 {
 	PrimaryComponentTick.bCanEverTick = true;
 	PrimaryComponentTick.bStartWithTickEnabled = true;
+	bTickInEditor = true;   // shapes draw in the editor viewport too
 }
 
 void USloshManipulatorComponent::OnRegister()

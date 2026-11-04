@@ -83,21 +83,22 @@ struct SLOSH_API FSloshVisualProperties
 
 	/** Upper bound on the bilateral smoothing radius in pixels (close-ups hit this cap). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0", ClampMax = "32"))
-	int32 SmoothingRadius = 24;
+	int32 SmoothingRadius = 7;
 
-	/** Smoothing radius as a multiple of the splat radius, so the surface looks equally smooth at any distance.
-	 *  Higher = fewer visible particle bumps, softer detail. 0 = fixed SmoothingRadius pixels. */
+	/** Adaptive smoothing: radius as a multiple of the splat radius, so the surface looks equally smooth at any
+	 *  distance, plus tilt-aware depth smoothing and a thickness blur. Suits thick, viscous liquids (honey, slime).
+	 *  0 = the classic fixed SmoothingRadius-pixel filter, which keeps water's fine ripples. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0.0", ClampMax = "8.0"))
-	float SmoothingScale = 4.0f;
+	float SmoothingScale = 0.0f;
 
 	/** Horizontal + vertical smoothing passes; each repeat flattens bumps further. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "1", ClampMax = "4"))
-	int32 SmoothingIterations = 3;
+	int32 SmoothingIterations = 1;
 
 	/** Stretch each particle along its neighbours (Yu & Turk 2013): films become discs and streams rods, so thin
 	 *  liquid renders as a sheet instead of beads. 0 = round splats. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0.0", ClampMax = "1.0"))
-	float Anisotropy = 0.85f;
+	float Anisotropy = 0.0f;
 
 	/** Largest allowed ratio between a splat's longest and shortest axis. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "1.0", ClampMax = "8.0", EditCondition = "Anisotropy > 0"))
@@ -110,7 +111,12 @@ struct SLOSH_API FSloshVisualProperties
 	/** Liquid thinner than this (cm, along the view ray) fades out, which hides stray single particles and
 	 *  softens the edges of films. 0 = hard edges. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0.0", ClampMax = "10.0", Units = "Centimeters"))
-	float EdgeFadeThickness = 1.5f;
+	float EdgeFadeThickness = 0.0f;
+
+	/** Light the in-scattered colour with a soft diffuse term (0 = flat, the classic look). Helps thick, opaque
+	 *  liquids keep their shape; water usually looks better at 0. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float ScatterLighting = 0.0f;
 };
 
 /** A liquid type: physical and visual properties are kept in separate structs and modules. */
