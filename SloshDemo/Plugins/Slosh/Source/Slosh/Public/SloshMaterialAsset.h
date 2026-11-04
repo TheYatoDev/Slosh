@@ -40,6 +40,15 @@ struct SLOSH_API FSloshPhysicalProperties
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float BoundaryFriction = 0.0f;
 
+	/** Pull toward nearby collider surfaces (0 = none, 1 = holds a film against gravity on overhangs). Makes thick
+	 *  liquids cling to and coat bodies instead of falling off; combine with BoundaryFriction for sticky liquids. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh", meta = (ClampMin = "0.0", ClampMax = "2.0"))
+	float Adhesion = 0.0f;
+
+	/** How far from a surface adhesion reaches, cm (about one solver cell works well). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh", meta = (ClampMin = "0.1", ClampMax = "20.0", Units = "Centimeters"))
+	float AdhesionDistance = 2.5f;
+
 	/** Strength of the particle-density correction that counters volume drift. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float DensityCorrection = 0.15f;
@@ -72,9 +81,36 @@ struct SLOSH_API FSloshVisualProperties
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0.1"))
 	float ParticleRadiusScale = 0.6f;
 
-	/** Bilateral smoothing radius in pixels. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0", ClampMax = "24"))
-	int32 SmoothingRadius = 7;
+	/** Upper bound on the bilateral smoothing radius in pixels (close-ups hit this cap). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0", ClampMax = "32"))
+	int32 SmoothingRadius = 24;
+
+	/** Smoothing radius as a multiple of the splat radius, so the surface looks equally smooth at any distance.
+	 *  Higher = fewer visible particle bumps, softer detail. 0 = fixed SmoothingRadius pixels. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0.0", ClampMax = "8.0"))
+	float SmoothingScale = 4.0f;
+
+	/** Horizontal + vertical smoothing passes; each repeat flattens bumps further. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "1", ClampMax = "4"))
+	int32 SmoothingIterations = 3;
+
+	/** Stretch each particle along its neighbours (Yu & Turk 2013): films become discs and streams rods, so thin
+	 *  liquid renders as a sheet instead of beads. 0 = round splats. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	float Anisotropy = 0.85f;
+
+	/** Largest allowed ratio between a splat's longest and shortest axis. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "1.0", ClampMax = "8.0", EditCondition = "Anisotropy > 0"))
+	float AnisotropyMaxStretch = 4.0f;
+
+	/** Pull of each splat toward its neighbourhood centre: evens out the surface, slightly shrinks edges. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0.0", ClampMax = "1.0", EditCondition = "Anisotropy > 0"))
+	float AnisotropySmoothing = 0.5f;
+
+	/** Liquid thinner than this (cm, along the view ray) fades out, which hides stray single particles and
+	 *  softens the edges of films. 0 = hard edges. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render", meta = (ClampMin = "0.0", ClampMax = "10.0", Units = "Centimeters"))
+	float EdgeFadeThickness = 1.5f;
 };
 
 /** A liquid type: physical and visual properties are kept in separate structs and modules. */

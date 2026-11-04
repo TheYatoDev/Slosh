@@ -342,6 +342,8 @@ int32 USloshSkeletalColliderComponent::RebuildColliders()
 		Collider->CapsuleHalfHeight = Fit.HalfHeight;
 		Collider->BoxExtent = (Fit.Extent * RadiusScale).ComponentMax(FVector(MinRadius));
 		Collider->CouplingMode = CouplingMode;
+		Collider->bReportFeedbackWhenKinematic = bReportWetness;
+		Collider->EnterThreshold = 0.02f;
 		Collider->SetupAttachment(Skinned, BoneName);
 		Collider->SetRelativeTransform(Fit.ComponentSpace.GetRelativeTransform(BindCS[Bone]));
 		Collider->RegisterComponent();

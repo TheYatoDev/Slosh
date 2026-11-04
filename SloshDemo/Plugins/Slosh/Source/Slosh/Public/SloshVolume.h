@@ -11,6 +11,22 @@
 class UBoxComponent;
 class USloshColliderComponent;
 class ADirectionalLight;
+class USloshSurfaceMeshComponent;
+class UMaterialInterface;
+class FSloshSurfaceMeshBuffers;
+
+/** How the liquid surface is drawn. */
+UENUM(BlueprintType)
+enum class ESloshSurfaceMode : uint8
+{
+	/** Screen-space particle splats with depth smoothing (cheapest; can look beady on thin films). */
+	Splats,
+	/** A smoothed density field ray-marched per pixel with the Slosh liquid shading: smooth by construction. */
+	Raymarched,
+	/** The same field turned into a GPU triangle mesh every frame and drawn with a UE material (SurfaceMaterial, or
+	 *  the paint material of a Fluid Painter preset assigned as Material). Engine lighting and shadows. */
+	Mesh,
+};
 
 /**
  * A box-shaped liquid simulation domain (dense MAC grid, GPU FLIP/APIC).
@@ -188,6 +204,35 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Runtime")
 	bool bRenderLiquid = true;
 
+	// ---- Surface ----
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Surface")
+	ESloshSurfaceMode SurfaceMode = ESloshSurfaceMode::Splats;
+
+	/** Density-field voxels per solver cell (Raymarched / Mesh). 2 doubles detail at 8x the memory and splat cost. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Surface", meta = (ClampMin = "0.5", ClampMax = "3.0", EditCondition = "SurfaceMode != ESloshSurfaceMode::Splats"))
+	float FieldResolution = 1.0f;
+
+	/** Kernel radius of each particle in the density field, in splat radii. Larger = smoother, rounder, less detail. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Surface", meta = (ClampMin = "0.5", ClampMax = "6.0", EditCondition = "SurfaceMode != ESloshSurfaceMode::Splats"))
+	float SurfaceSmoothing = 2.0f;
+
+	/** Where the surface sits: 0.5 = at the particle radius. Lower makes the liquid fatter and more connected,
+	 *  higher makes it thinner and more detailed. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Surface", meta = (ClampMin = "0.05", ClampMax = "0.95", EditCondition = "SurfaceMode != ESloshSurfaceMode::Splats"))
+	float SurfaceIsoLevel = 0.5f;
+
+	/** Material of the surface mesh. Empty: the Material slot's Fluid Painter preset material, else the default material. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Surface", meta = (EditCondition = "SurfaceMode == ESloshSurfaceMode::Mesh"))
+	TObjectPtr<UMaterialInterface> SurfaceMaterial;
+
+	/** GPU vertex budget of the surface mesh (indices get 6x). Surface past the budget is dropped. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Surface", meta = (ClampMin = "1024", EditCondition = "SurfaceMode == ESloshSurfaceMode::Mesh"))
+	int32 MaxSurfaceVertices = 1000000;
+
+	/** The material the surface mesh draws with (SurfaceMaterial, else the preset's paint material, else null). */
+	UFUNCTION(BlueprintPure, Category = "Slosh|Surface")
+	UMaterialInterface* GetEffectiveSurfaceMaterial() const;
+
 	/** Directional light used for liquid specular. Auto-detected when unset. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Render")
 	TObjectPtr<ADirectionalLight> SunLight;
@@ -207,8 +252,8 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Slosh")
 	void EmitSphere(FVector WorldCenter, float Radius, FVector WorldVelocity, int32 Count);
 
-	/** Remove all liquid and reallocate GPU state. */
-	UFUNCTION(BlueprintCallable, Category = "Slosh")
+	/** Remove all liquid and reallocate GPU state. Also a details-panel button while playing. */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Slosh")
 	void ResetSimulation();
 
 	UFUNCTION(BlueprintCallable, Category = "Slosh")
@@ -221,9 +266,16 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Slosh")
 	FVector GetDomainSize() const;
 
-	/** Live particle count (exact; tracked on the game thread). */
+	/** Particles in the volume: the GPU count from the latest readback (drains included), else everything emitted. */
 	UFUNCTION(BlueprintPure, Category = "Slosh")
-	int32 GetParticleCount() const { return int32(FMath::Min<int64>(TotalEmittedGameThread, ParticleCapacity)); }
+	int32 GetParticleCount() const
+	{
+		return LatestResults.LiveParticles >= 0 ? LatestResults.LiveParticles : int32(FMath::Min<int64>(TotalEmittedGameThread, ParticleCapacity));
+	}
+
+	/** Particles removed by drains since play started or the last reset (delayed GPU feedback). */
+	UFUNCTION(BlueprintPure, Category = "Slosh|Diagnostics")
+	int64 GetDrainedParticleCount() const { return LatestResults.DrainedParticles; }
 
 	/** Liquid volume estimated from fluid cells, liters (delayed GPU readback). */
 	UFUNCTION(BlueprintPure, Category = "Slosh")
@@ -272,6 +324,11 @@ private:
 
 	UPROPERTY(VisibleAnywhere, Category = "Slosh")
 	TObjectPtr<UBoxComponent> Bounds;
+
+	UPROPERTY(Transient)
+	TObjectPtr<USloshSurfaceMeshComponent> SurfaceMeshComponent;
+
+	TSharedPtr<FSloshSurfaceMeshBuffers, ESPMode::ThreadSafe> SurfaceMeshBuffers;
 
 	FSloshProxyPtr Proxy;
 	TArray<FSloshEmitRequest> PendingEmits;

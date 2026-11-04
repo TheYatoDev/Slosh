@@ -14,7 +14,7 @@ DECLARE_GPU_STAT(Slosh);
 namespace
 {
 	constexpr int32 ThreadGroupSize = 128;
-	constexpr uint32 NumStats = 14;
+	constexpr uint32 NumStats = 16;   // [14] particle slots in use (GPU count), [15] particles drained
 	constexpr uint32 BrickCells = 512;   // 8^3 cells per brick / pool slot
 	constexpr uint32 MinParticleSlots = 16384;
 	constexpr uint32 ParticleSlotAlignment = 16384;
@@ -214,8 +214,10 @@ void FSloshProxy::Allocate(FRDGBuilder& GraphBuilder, const FSloshSolverSettings
 	ParticleMemoryBytes = 0;
 	NumParticles = 0;
 	EnsureParticleCapacity(GraphBuilder, MinParticleSlots);
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(CreatePersistent(GraphBuilder, ParticleCountBuffer, TEXT("Slosh.ParticleCount"), sizeof(uint32), 4)), 0u);
 	SortBrickDim = FIntVector((D.X + 3) / 4, (D.Y + 3) / 4, (D.Z + 3) / 4);
-	NumSortKeys = uint32(SortBrickDim.X) * uint32(SortBrickDim.Y) * uint32(SortBrickDim.Z);
+	// One key per 4^3 brick plus a last key that collects removed particles (the sort also compacts).
+	NumSortKeys = uint32(SortBrickDim.X) * uint32(SortBrickDim.Y) * uint32(SortBrickDim.Z) + 1u;
 	NumScanBlocks = FMath::DivideAndRoundUp(NumSortKeys, SortScanBlock);
 	Persistent(SortCountsBuffer, TEXT("Slosh.SortCounts"), sizeof(uint32), NumSortKeys);
 	Persistent(SortOffsetsBuffer, TEXT("Slosh.SortOffsets"), sizeof(uint32), NumSortKeys);
@@ -373,6 +375,21 @@ void FSloshProxy::Step_RenderThread(FRDGBuilder& GraphBuilder, const FSloshFrame
 		: CreateStructuredBuffer(GraphBuilder, TEXT("Slosh.Colliders"), sizeof(FSloshColliderGPU), 1,
 			&DummyCollider, sizeof(FSloshColliderGPU));
 
+	const uint32 NumManipulators = FMath::Min<uint32>(Input.Manipulators.Num(), Slosh::MaxManipulators);
+	bool bHasDrain = false;
+	for (uint32 Index = 0; Index < NumManipulators; ++Index)
+	{
+		bHasDrain |= Input.Manipulators[Index].Kind == uint32(ESloshManipulatorKind::Drain);
+	}
+	static const FSloshManipulatorGPU DummyManipulator;
+	FRDGBufferRef Manipulators = NumManipulators > 0
+		? CreateStructuredBuffer(GraphBuilder, TEXT("Slosh.Manipulators"), sizeof(FSloshManipulatorGPU), NumManipulators,
+			Input.Manipulators.GetData(), NumManipulators * sizeof(FSloshManipulatorGPU))
+		: CreateStructuredBuffer(GraphBuilder, TEXT("Slosh.Manipulators"), sizeof(FSloshManipulatorGPU), 1,
+			&DummyManipulator, sizeof(FSloshManipulatorGPU));
+	FRDGBufferRef ParticleCount = GraphBuilder.RegisterExternalBuffer(ParticleCountBuffer);
+	FRDGBufferUAVRef ParticleCountUAV = GraphBuilder.CreateUAV(ParticleCount);
+
 	FRDGBufferUAVRef VelUAV[3] = { GraphBuilder.CreateUAV(Vel[0]), GraphBuilder.CreateUAV(Vel[1]), GraphBuilder.CreateUAV(Vel[2]) };
 	FRDGBufferUAVRef CouplingUAV = GraphBuilder.CreateUAV(Coupling);
 	FRDGBufferUAVRef StatsUAV = GraphBuilder.CreateUAV(Stats);
@@ -395,6 +412,9 @@ void FSloshProxy::Step_RenderThread(FRDGBuilder& GraphBuilder, const FSloshFrame
 	Base.bUseAPIC = S.TransferMode == ESloshTransferMode::APIC ? 1u : 0u;
 	Base.MaxSpeed = FMath::Max(S.MaxSpeed, 0.1f);
 	Base.Friction = FMath::Clamp(S.BoundaryFriction, 0.0f, 1.0f);
+	// 1.5 g at Adhesion 1: enough to hold a contact layer on an overhang against gravity.
+	Base.AdhesionAccel = FMath::Max(S.Adhesion, 0.0f) * 1.5f * S.Gravity.Size();
+	Base.AdhesionRange = FMath::Max(S.AdhesionDistance, 1e-4f);
 	Base.ParticleRadius = S.ParticleRadiusCells * H;
 	Base.SORWeight = FMath::Clamp(S.SORWeight, 0.5f, 1.95f);
 	// The two-sided position projection replaces the one-sided velocity correction.
@@ -458,9 +478,13 @@ void FSloshProxy::Step_RenderThread(FRDGBuilder& GraphBuilder, const FSloshFrame
 	Base.Coupling = CouplingUAV;
 	Base.Stats = StatsUAV;
 	Base.Colliders = GraphBuilder.CreateSRV(Colliders);
+	Base.Manipulators = GraphBuilder.CreateSRV(Manipulators);
+	Base.NumManipulators = NumManipulators;
+	Base.ParticleCount = ParticleCountUAV;
 
-	// Emission appends after the live particles and stops at capacity. (Recycling slots is incompatible with
-	// the spatial sort: slot order is spatial, so overwriting a range would erase a contiguous region.)
+	// Emission appends at the GPU particle count (live particles plus any not yet compacted) and stops at capacity.
+	// NumParticles is the CPU upper bound of that count: dispatch size, grown by every emission and pulled back
+	// to the GPU count by the stats readback (drains free slots, the spatial sort compacts them).
 	// Particle buffers grow first if this frame's emission needs more slots.
 	{
 		uint64 Requested = NumParticles;
@@ -489,12 +513,18 @@ void FSloshProxy::Step_RenderThread(FRDGBuilder& GraphBuilder, const FSloshFrame
 			{
 				continue;
 			}
-			const uint32 Cursor = NumParticles;
+			const uint32 Bound = NumParticles;
+			AddSimPass<FSloshEmitReserveCS>(GraphBuilder, RDG_EVENT_NAME("EmitReserve"), Base, 1u,
+				[&](FSloshPassParameters& P) { P.EmitCount = uint32(Count); });
 			AddSimPass<FSloshEmitParticlesCS>(GraphBuilder, RDG_EVENT_NAME("EmitParticles(%u)", uint32(Count)), Base, uint32(Count),
 				[&](FSloshPassParameters& P)
 				{
 					P.EmitCount = uint32(Count);
-					P.EmitCursor = Cursor;
+					P.EmitCursor = Bound;
+					P.EmitBound = Bound;
+					P.EmitRotation = Emit.Rotation;
+					P.EmitSpread = Emit.VelocitySpread;
+					P.EmitSpeedJitter = Emit.SpeedJitter;
 					P.EmitMode = uint32(Emit.Shape);
 					P.EmitSeed = EmitSeed++;
 					P.EmitCenter = Emit.Center;
@@ -510,7 +540,8 @@ void FSloshProxy::Step_RenderThread(FRDGBuilder& GraphBuilder, const FSloshFrame
 	}
 	Base.NumParticles = NumParticles;
 
-	if (S.SortInterval > 0 && NumParticles > 0 && (SimFrame % uint64(S.SortInterval)) == 0)
+	// The sort also compacts removed particles; with drains active, compact at least every 8 frames.
+	if (NumParticles > 0 && ((S.SortInterval > 0 && (SimFrame % uint64(S.SortInterval)) == 0) || (bHasDrain && (SimFrame % 8ull) == 0)))
 	{
 		Particles = AddSpatialSort(GraphBuilder, Particles);
 		Base.Particles = GraphBuilder.CreateUAV(Particles);
@@ -671,6 +702,7 @@ void FSloshProxy::Step_RenderThread(FRDGBuilder& GraphBuilder, const FSloshFrame
 			}
 			AddSimPass<FSloshG2PAdvectCS>(GraphBuilder, RDG_EVENT_NAME("G2P+Advect"), Base, NumParticles,
 				[&](FSloshPassParameters& P) { BindVel(P, Cur, (Cur + 1) % 3, (Cur + 2) % 3); P.bApplyDensityProjection = bDensityProjection ? 1u : 0u;
+					P.FrameSeed = uint32(SimFrame * 16ull + uint64(Step));
 					P.BrickTouch = BrickTouchUAV; });
 
 			// Keep the post-step field in Vel[0] for the next substep / external consumers.
@@ -686,6 +718,9 @@ void FSloshProxy::Step_RenderThread(FRDGBuilder& GraphBuilder, const FSloshFrame
 		}
 	}
 
+	// Drained total and the GPU particle count into Stats[14..15] (every frame, so no drained particle is missed).
+	AddSimPass<FSloshAccumulateStatsCS>(GraphBuilder, RDG_EVENT_NAME("AccumulateStats"), Base, 1u, NoCustomization);
+
 	// Asynchronous feedback: copy the small coupling/stat buffers into a free readback slot.
 	FReadbackSlot& Slot = Readbacks[NextReadbackSlot];
 	if (!Slot.bPending && Substeps > 0)
@@ -696,6 +731,7 @@ void FSloshProxy::Step_RenderThread(FRDGBuilder& GraphBuilder, const FSloshFrame
 		Slot.Frame = SimFrame;
 		Slot.Substeps = Substeps;
 		Slot.NumColliders = int32(NumColliders);
+		Slot.TotalEmittedAtSubmit = TotalEmitted;
 		NextReadbackSlot = (NextReadbackSlot + 1) % NumReadbackSlots;
 	}
 }
@@ -750,6 +786,10 @@ void FSloshProxy::PollReadbacks_RenderThread()
 		NewResults.GridMemoryMB = float(double(GridMemoryBytes) / (1024.0 * 1024.0));
 		NewResults.ParticleMemoryMB = float(double(ParticleMemoryBytes) / (1024.0 * 1024.0));
 		NewResults.AllocatedParticleCapacity = int32(AllocatedParticleCapacity);
+		NewResults.LiveParticles = int32(StatsData[14]);
+		NewResults.DrainedParticles = int64(StatsData[15]);
+		// Pull the dispatch bound back to the GPU count of that frame plus everything emitted since.
+		NumParticles = uint32(FMath::Min<uint64>(NumParticles, uint64(StatsData[14]) + (TotalEmitted - Slot.TotalEmittedAtSubmit)));
 		LastPoolUsage = NewResults.PoolUsage;
 		Slot.Stats->Unlock();
 
@@ -1031,6 +1071,14 @@ FRDGBufferRef FSloshProxy::AddSpatialSort(FRDGBuilder& GraphBuilder, FRDGBufferR
 		P->SortOffsets = Offsets;
 		P->ScanBlockSums = BlockSums;
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("Scatter"), TShaderMapRef<FSloshSortScatterCS>(ShaderMap), P, Groups(NumParticles));
+	}
+	{
+		FSloshSortParameters* P = GraphBuilder.AllocParameters<FSloshSortParameters>();
+		*P = Common;
+		P->SortOffsets = Offsets;
+		P->ScanBlockSums = BlockSums;
+		P->ParticleCount = GraphBuilder.CreateUAV(GraphBuilder.RegisterExternalBuffer(ParticleCountBuffer));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("WriteLiveCount"), TShaderMapRef<FSloshSortWriteCountCS>(ShaderMap), P, FIntVector(1, 1, 1));
 	}
 
 	// The sorted copy becomes the live particle buffer (renderer reads it through GetParticleBuffer_RenderThread).

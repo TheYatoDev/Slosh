@@ -145,6 +145,36 @@ float3 QuatRotateInv(float4 Q, float3 V)
 	return QuatRotate(float4(-Q.xyz, Q.w), V);
 }
 
+// Particle manipulators (drains and force fields). Must match FSloshManipulatorGPU (80 bytes).
+#define MANIP_DRAIN       0u
+#define MANIP_DIRECTIONAL 1u
+#define MANIP_RADIAL      2u
+#define MANIP_SWIRL       3u
+#define MANIP_DRAG        4u
+#define MANIP_SHAPE_EVERYWHERE 3u
+struct FSloshManipulator
+{
+	float3 Center;
+	uint   Kind;
+	float4 Rotation;
+	float3 Extent;
+	uint   Shape;
+	float3 Axis;
+	float  Strength;
+	float  Falloff;
+	float  Param0;
+	float  Param1;
+	uint   Pad;
+};
+
+// Removed (drained) particles keep their slot with a negative age until the next compaction; every particle
+// pass skips them.
+bool IsDeadParticleAge(float Age)
+{
+	return !(Age >= 0.0);
+}
+
+
 float ColliderSDF(FSloshCollider C, float3 P)
 {
 	float3 L = QuatRotateInv(C.Rotation, P - C.Center);
@@ -172,6 +202,31 @@ float3 ColliderNormal(FSloshCollider C, float3 P, float Eps)
 	N.z = ColliderSDF(C, P + float3(0, 0, Eps)) - ColliderSDF(C, P - float3(0, 0, Eps));
 	float Len = length(N);
 	return Len > 1e-8 ? N / Len : float3(0, 0, 1);
+}
+
+float ManipulatorSDF(FSloshManipulator F, float3 P)
+{
+	if (F.Shape == MANIP_SHAPE_EVERYWHERE)
+	{
+		return -1.0;
+	}
+	FSloshCollider C = (FSloshCollider)0;
+	C.Center = F.Center;
+	C.Type = F.Shape;
+	C.Rotation = F.Rotation;
+	C.Extent = F.Extent;
+	return ColliderSDF(C, P);
+}
+
+// 1 inside the shape, fading linearly to 0 at Falloff beyond its surface.
+float ManipulatorWeight(FSloshManipulator F, float3 P)
+{
+	float D = ManipulatorSDF(F, P);
+	if (D <= 0.0)
+	{
+		return 1.0;
+	}
+	return F.Falloff > 0.0 ? saturate(1.0 - D / F.Falloff) : 0.0;
 }
 
 float3 ColliderVelocityAt(FSloshCollider C, float3 P)

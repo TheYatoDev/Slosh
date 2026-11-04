@@ -30,11 +30,13 @@ RWTexture2D<uint> FluidThicknessUint;
 Texture2D<uint>  DepthUintIn;
 Texture2D<uint>  ThicknessUintIn;
 Texture2D<float> DepthIn;
+Texture2D<float> GuideDepth;
 RWTexture2D<float> DepthOut;
 RWTexture2D<float> ThicknessOut;
 int2   FilterDirection;
-int    FilterRadius;
-float  DepthFalloff;
+int    FilterRadius;      // pixel cap
+float  RadiusPerViewZ;    // > 0: radius = RadiusPerViewZ / viewZ pixels (world-constant footprint)
+float  DepthFalloff;      // <= 0: plain Gaussian (thickness)
 
 // Composite
 Texture2D<float> FluidDepth;
@@ -50,6 +52,9 @@ float3 SkyHorizonColor;
 float  RefractionStrength;
 float  SpecularPower;
 float  FresnelF0;
+float  EdgeFadeThickness;   // cm; thinner liquid fades into the scene
+uint   bHasFluidNormal;     // 1: use FluidNormal (ray-marched surface) instead of depth-derived normals
+Texture2D<float4> FluidNormal;
 
 float DeviceZToViewZ(float DeviceZ)
 {
@@ -75,6 +80,10 @@ void SplatParticlesCS(uint3 DTid : SV_DispatchThreadID)
 {
 	uint I = LinearThreadId(DTid, SLOSH_THREADS);
 	if (I >= NumParticles)
+	{
+		return;
+	}
+	if (IsDeadParticleAge(Particles[I].Age))
 	{
 		return;
 	}
@@ -121,6 +130,314 @@ void SplatParticlesCS(uint3 DTid : SV_DispatchThreadID)
 	}
 }
 
+// ---------------------------------------------------------------------------------------------
+// Anisotropic particles (after Yu & Turk 2013). Every frame:
+//   AnisoBinCS      hashes each particle's cell (open addressing) and accumulates fixed-point moments
+//                   (count, sum of offsets, sum of offset outer products) relative to the cell corner.
+//   AnisoComputeCS  gathers the 3x3x3 neighbourhood with tent weights centred on the particle, takes the
+//                   weighted covariance, eigen-decomposes it and writes a stretched, volume-preserving
+//                   ellipsoid (centre + three scaled axes, sim space) per particle.
+//   SplatEllipsoidsCS ray-casts those ellipsoids into the same depth / thickness targets as the spheres.
+// Films flatten into discs and streams into rods, so thin liquid reads as a sheet instead of beads.
+// ---------------------------------------------------------------------------------------------
+#define ANISO_EMPTY 0xFFFFFFFFu
+#define ANISO_MOMENTS 10u
+#define ANISO_FIXED 1023.0
+#define ANISO_MAX_PROBES 32u
+
+float  BinSize;              // sim metres per hash cell
+uint   TableMask;            // table size - 1 (power of two)
+float  SplatRadiusSim;       // sphere radius in sim metres
+float  AnisoStrength;        // 0 = spheres, 1 = full anisotropy
+float  AnisoMaxStretch;      // largest / smallest axis ratio
+float  AnisoSmoothing;       // 0..1 pull of the centre toward the neighbourhood mean
+float  AnisoMinNeighbours;   // weighted neighbour count below which a particle stays a sphere
+RWStructuredBuffer<uint> HashKeys;
+RWStructuredBuffer<uint> HashMoments;
+RWStructuredBuffer<float4> Ellipsoids;     // 4 per particle: centre.xyz, axis0, axis1, axis2 (sim metres)
+StructuredBuffer<float4> EllipsoidsIn;
+
+uint AnisoKey(int3 C)
+{
+	uint3 U = uint3(clamp(C, 0, 1023));
+	return U.x | (U.y << 10) | (U.z << 20);
+}
+
+uint AnisoHash(uint Key)
+{
+	Key ^= Key >> 16;
+	Key *= 0x7feb352du;
+	Key ^= Key >> 15;
+	Key *= 0x846ca68bu;
+	Key ^= Key >> 16;
+	return Key & TableMask;
+}
+
+uint AnisoFind(uint Key)
+{
+	uint Slot = AnisoHash(Key);
+	for (uint Probe = 0; Probe < ANISO_MAX_PROBES; ++Probe)
+	{
+		uint K = HashKeys[Slot];
+		if (K == Key)
+		{
+			return Slot;
+		}
+		if (K == ANISO_EMPTY)
+		{
+			return ANISO_EMPTY;
+		}
+		Slot = (Slot + 1u) & TableMask;
+	}
+	return ANISO_EMPTY;
+}
+
+[numthreads(SLOSH_THREADS, 1, 1)]
+void AnisoBinCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I = LinearThreadId(DTid, SLOSH_THREADS);
+	if (I >= NumParticles)
+	{
+		return;
+	}
+	if (IsDeadParticleAge(Particles[I].Age))
+	{
+		return;
+	}
+	float3 G = Particles[I].Pos / BinSize;
+	int3 C = int3(floor(G));
+	uint Key = AnisoKey(C);
+	uint Slot = AnisoHash(Key);
+	bool bFound = false;
+	for (uint Probe = 0; Probe < ANISO_MAX_PROBES; ++Probe)
+	{
+		uint Prev;
+		InterlockedCompareExchange(HashKeys[Slot], ANISO_EMPTY, Key, Prev);
+		if (Prev == ANISO_EMPTY || Prev == Key)
+		{
+			bFound = true;
+			break;
+		}
+		Slot = (Slot + 1u) & TableMask;
+	}
+	if (!bFound)
+	{
+		return;
+	}
+	uint3 Q = uint3(saturate(G - float3(C)) * ANISO_FIXED);
+	uint Base = Slot * ANISO_MOMENTS;
+	InterlockedAdd(HashMoments[Base + 0], 1u);
+	InterlockedAdd(HashMoments[Base + 1], Q.x);
+	InterlockedAdd(HashMoments[Base + 2], Q.y);
+	InterlockedAdd(HashMoments[Base + 3], Q.z);
+	InterlockedAdd(HashMoments[Base + 4], Q.x * Q.x);
+	InterlockedAdd(HashMoments[Base + 5], Q.y * Q.y);
+	InterlockedAdd(HashMoments[Base + 6], Q.z * Q.z);
+	InterlockedAdd(HashMoments[Base + 7], Q.x * Q.y);
+	InterlockedAdd(HashMoments[Base + 8], Q.x * Q.z);
+	InterlockedAdd(HashMoments[Base + 9], Q.y * Q.z);
+}
+
+// Cyclic Jacobi eigen-decomposition of a symmetric 3x3 matrix (A = V diag(E) V^T, eigenvectors in columns).
+void JacobiEigen3(float3x3 A, out float3 E, out float3x3 V)
+{
+	V = float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
+	[loop]
+	for (int Sweep = 0; Sweep < 5; ++Sweep)
+	{
+		[unroll]
+		for (int Pair = 0; Pair < 3; ++Pair)
+		{
+			int P = Pair == 2 ? 1 : 0;
+			int Qi = Pair == 0 ? 1 : 2;
+			float Apq = A[P][Qi];
+			if (abs(Apq) < 1e-12)
+			{
+				continue;
+			}
+			float Theta = (A[Qi][Qi] - A[P][P]) / (2.0 * Apq);
+			float T = sign(Theta) / (abs(Theta) + sqrt(Theta * Theta + 1.0));
+			if (Theta == 0.0)
+			{
+				T = 1.0;
+			}
+			float Cs = rsqrt(T * T + 1.0);
+			float Sn = T * Cs;
+			float3x3 J = float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
+			J[P][P] = Cs;
+			J[Qi][Qi] = Cs;
+			J[P][Qi] = Sn;
+			J[Qi][P] = -Sn;
+			A = mul(transpose(J), mul(A, J));
+			V = mul(V, J);
+		}
+	}
+	E = float3(A[0][0], A[1][1], A[2][2]);
+}
+
+[numthreads(SLOSH_THREADS, 1, 1)]
+void AnisoComputeCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I = LinearThreadId(DTid, SLOSH_THREADS);
+	if (I >= NumParticles)
+	{
+		return;
+	}
+	if (IsDeadParticleAge(Particles[I].Age))
+	{
+		// Removed particle: a zero-size ellipsoid that every consumer skips.
+		Ellipsoids[I * 4u + 0u] = 0.0;
+		Ellipsoids[I * 4u + 1u] = 0.0;
+		Ellipsoids[I * 4u + 2u] = 0.0;
+		Ellipsoids[I * 4u + 3u] = 0.0;
+		return;
+	}
+	float3 Pos = Particles[I].Pos;
+	float3 G = Pos / BinSize;
+	int3 C = int3(floor(G));
+	float3 Off = G - float3(C);   // particle position in its own cell, cell units
+
+	// Weighted moments in cell units relative to the particle's cell corner.
+	float W = 0.0;
+	float3 M1 = 0.0;
+	float3 M2d = 0.0;   // xx, yy, zz
+	float3 M2o = 0.0;   // xy, xz, yz
+	[loop]
+	for (int Dz = -1; Dz <= 1; ++Dz)
+	{
+		[loop]
+		for (int Dy = -1; Dy <= 1; ++Dy)
+		{
+			[loop]
+			for (int Dx = -1; Dx <= 1; ++Dx)
+			{
+				float3 D = float3(Dx, Dy, Dz);
+				float3 Tent = max(1.5 - abs(D + 0.5 - Off), 0.0);
+				float Wc = Tent.x * Tent.y * Tent.z;
+				if (Wc <= 0.0)
+				{
+					continue;
+				}
+				uint Slot = AnisoFind(AnisoKey(C + int3(Dx, Dy, Dz)));
+				if (Slot == ANISO_EMPTY)
+				{
+					continue;
+				}
+				uint Base = Slot * ANISO_MOMENTS;
+				float N = float(HashMoments[Base + 0]);
+				float3 S1 = float3(HashMoments[Base + 1], HashMoments[Base + 2], HashMoments[Base + 3]) / ANISO_FIXED;
+				float3 S2d = float3(HashMoments[Base + 4], HashMoments[Base + 5], HashMoments[Base + 6]) / (ANISO_FIXED * ANISO_FIXED);
+				float3 S2o = float3(HashMoments[Base + 7], HashMoments[Base + 8], HashMoments[Base + 9]) / (ANISO_FIXED * ANISO_FIXED);
+				// Shift the neighbour cell's moments by its corner offset D.
+				W += Wc * N;
+				M1 += Wc * (N * D + S1);
+				M2d += Wc * (N * D * D + 2.0 * D * S1 + S2d);
+				M2o += Wc * (N * float3(D.x * D.y, D.x * D.z, D.y * D.z)
+					+ float3(D.x * S1.y + D.y * S1.x, D.x * S1.z + D.z * S1.x, D.y * S1.z + D.z * S1.y) + S2o);
+			}
+		}
+	}
+
+	float3 Center = Pos;
+	float3 Axis0 = float3(SplatRadiusSim, 0, 0);
+	float3 Axis1 = float3(0, SplatRadiusSim, 0);
+	float3 Axis2 = float3(0, 0, SplatRadiusSim);
+	if (W >= AnisoMinNeighbours && AnisoStrength > 0.0)
+	{
+		float3 Mean = M1 / W;
+		float3 Vd = M2d / W - Mean * Mean;
+		float3 Vo = M2o / W - float3(Mean.x * Mean.y, Mean.x * Mean.z, Mean.y * Mean.z);
+		float3x3 Cov = float3x3(
+			Vd.x, Vo.x, Vo.y,
+			Vo.x, Vd.y, Vo.z,
+			Vo.y, Vo.z, Vd.z);
+		float3 E;
+		float3x3 V;
+		JacobiEigen3(Cov, E, V);
+		E = max(E, 0.0);
+		float EMax = max(max(E.x, E.y), max(E.z, 1e-8));
+		// Clamp the variance ratio so the stretch never exceeds AnisoMaxStretch, then preserve volume.
+		E = max(E, EMax / (AnisoMaxStretch * AnisoMaxStretch));
+		float3 S = sqrt(E);
+		S /= pow(S.x * S.y * S.z, 1.0 / 3.0);
+		S = pow(S, AnisoStrength);
+		Axis0 = float3(V[0][0], V[1][0], V[2][0]) * (SplatRadiusSim * S.x);
+		Axis1 = float3(V[0][1], V[1][1], V[2][1]) * (SplatRadiusSim * S.y);
+		Axis2 = float3(V[0][2], V[1][2], V[2][2]) * (SplatRadiusSim * S.z);
+		Center = lerp(Pos, (float3(C) + Mean) * BinSize, AnisoSmoothing);
+	}
+	Ellipsoids[I * 4u + 0u] = float4(Center, 0.0);
+	Ellipsoids[I * 4u + 1u] = float4(Axis0, 0.0);
+	Ellipsoids[I * 4u + 2u] = float4(Axis1, 0.0);
+	Ellipsoids[I * 4u + 3u] = float4(Axis2, 0.0);
+}
+
+[numthreads(SLOSH_THREADS, 1, 1)]
+void SplatEllipsoidsCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I = LinearThreadId(DTid, SLOSH_THREADS);
+	if (I >= NumParticles)
+	{
+		return;
+	}
+	if (dot(EllipsoidsIn[I * 4u + 1u].xyz, EllipsoidsIn[I * 4u + 1u].xyz) <= 0.0)
+	{
+		return;
+	}
+	float3 Cv = mul(float4(EllipsoidsIn[I * 4u].xyz, 1.0), SimToView).xyz;
+	float3 U0 = mul(float4(EllipsoidsIn[I * 4u + 1u].xyz, 0.0), SimToView).xyz;
+	float3 U1 = mul(float4(EllipsoidsIn[I * 4u + 2u].xyz, 0.0), SimToView).xyz;
+	float3 U2 = mul(float4(EllipsoidsIn[I * 4u + 3u].xyz, 0.0), SimToView).xyz;
+	float A0 = dot(U0, U0), A1 = dot(U1, U1), A2 = dot(U2, U2);
+	float BoundRadius = sqrt(max(A0, max(A1, A2)));
+	if (Cv.z < BoundRadius + 1.0)
+	{
+		return;
+	}
+	// (p - c)^T Q (p - c) = 1 with Q = sum(u u^T / |u|^4); W_k = u_k / |u_k|^2.
+	float3 W0 = U0 / max(A0, 1e-8), W1 = U1 / max(A1, 1e-8), W2 = U2 / max(A2, 1e-8);
+	float3 Cw = float3(dot(Cv, W0), dot(Cv, W1), dot(Cv, W2));
+	float Cterm = dot(Cw, Cw) - 1.0;
+
+	float4 Clip = mul(float4(Cv, 1.0), ViewToClip);
+	float2 Ndc = Clip.xy / Clip.w;
+	float2 CenterPx = float2((Ndc.x * 0.5 + 0.5) * ViewSize.x, (0.5 - Ndc.y * 0.5) * ViewSize.y) + float2(ViewRectMin);
+	float RadiusPx = min(BoundRadius * ViewToClip[0][0] * 0.5 * float(ViewSize.x) / Cv.z, MaxSplatPixels);
+
+	int2 PMin = max(int2(floor(CenterPx - RadiusPx)), ViewRectMin);
+	int2 PMax = min(int2(ceil(CenterPx + RadiusPx)), ViewRectMin + ViewSize - 1);
+	if (any(PMin > PMax))
+	{
+		return;
+	}
+	for (int Y = PMin.y; Y <= PMax.y; ++Y)
+	{
+		for (int X = PMin.x; X <= PMax.x; ++X)
+		{
+			float3 Ray = ViewPositionFromDepth(int2(X, Y), 1.0);   // view-space ray with z = 1
+			float3 Rw = float3(dot(Ray, W0), dot(Ray, W1), dot(Ray, W2));
+			float Aq = dot(Rw, Rw);
+			float Bq = dot(Rw, Cw);
+			float Disc = Bq * Bq - Aq * Cterm;
+			if (Disc <= 0.0 || Aq <= 0.0)
+			{
+				continue;
+			}
+			float Root = sqrt(Disc);
+			float Depth = (Bq - Root) / Aq;   // view z, since Ray.z = 1
+			float SceneZ = DeviceZToViewZ(SceneDepthTexture.Load(int3(X, Y, 0)).r);
+			if (Depth <= 1.0 || Depth > SceneZ)
+			{
+				continue;
+			}
+			InterlockedMin(FluidDepthUint[int2(X, Y)], asuint(Depth));
+			float Through = 2.0 * Root / Aq * length(Ray);
+			uint Thick = uint(min(Through, SceneZ - Depth) * THICKNESS_FIXED_SCALE);
+			InterlockedAdd(FluidThicknessUint[int2(X, Y)], Thick);
+		}
+	}
+}
+
 [numthreads(RENDER_THREADS_2D, RENDER_THREADS_2D, 1)]
 void ResolveCS(uint3 DTid : SV_DispatchThreadID)
 {
@@ -134,7 +451,8 @@ void ResolveCS(uint3 DTid : SV_DispatchThreadID)
 	ThicknessOut[Pixel] = float(ThicknessUintIn.Load(int3(Pixel, 0))) / THICKNESS_FIXED_SCALE;
 }
 
-// Separable bilateral filter on view depth. Background pixels are neither filtered nor used.
+// Separable filter on view depth (bilateral) or thickness (Gaussian). GuideDepth masks background pixels and,
+// when RadiusPerViewZ > 0, sets a per-pixel radius that covers the same world-space footprint at any distance.
 [numthreads(RENDER_THREADS_2D, RENDER_THREADS_2D, 1)]
 void SmoothDepthCS(uint3 DTid : SV_DispatchThreadID)
 {
@@ -144,24 +462,57 @@ void SmoothDepthCS(uint3 DTid : SV_DispatchThreadID)
 	}
 	int2 Pixel = int2(DTid.xy) + ViewRectMin;
 	float Center = DepthIn.Load(int3(Pixel, 0));
-	if (Center >= NO_FLUID_DEPTH)
+	float CenterZ = GuideDepth.Load(int3(Pixel, 0));
+	if (CenterZ >= NO_FLUID_DEPTH)
 	{
 		DepthOut[Pixel] = Center;
 		return;
 	}
-	float Sigma = max(float(FilterRadius) * 0.5, 0.5);
+	int Radius = FilterRadius;
+	if (RadiusPerViewZ > 0.0)
+	{
+		Radius = clamp(int(RadiusPerViewZ / max(CenterZ, 1.0) + 0.5), 1, FilterRadius);
+	}
+	// Slope-aware range weight (depth pass only). A surface seen at a grazing angle changes view depth by more
+	// than DepthFalloff per pixel, so a flat-depth bilateral refuses to smooth across rows of splats and the
+	// stair steps survive as streaks of wrong normals (sky reflections). Measure neighbours against the local
+	// plane instead, and average the plane-corrected depths. Monotone neighbourhoods give a slope; peaks and
+	// valleys (bumps, real edges) give zero, so silhouettes still stop the filter.
+	float Slope = 0.0;
+	if (DepthFalloff > 0.0)
+	{
+		float Zm = GuideDepth.Load(int3(clamp(Pixel - FilterDirection * 2, ViewRectMin, ViewRectMin + ViewSize - 1), 0));
+		float Zp = GuideDepth.Load(int3(clamp(Pixel + FilterDirection * 2, ViewRectMin, ViewRectMin + ViewSize - 1), 0));
+		if (Zm < NO_FLUID_DEPTH && Zp < NO_FLUID_DEPTH && (Zp - CenterZ) * (CenterZ - Zm) > 0.0)
+		{
+			Slope = (Zp - Zm) * 0.25;
+			// A jump much larger than a splat between the two sides is a real depth edge, not a tilt.
+			if (abs(Slope) > DepthFalloff * 4.0)
+			{
+				Slope = 0.0;
+			}
+		}
+	}
+	float Sigma = max(float(Radius) * 0.5, 0.5);
 	float Sum = 0.0;
 	float WSum = 0.0;
-	for (int O = -FilterRadius; O <= FilterRadius; ++O)
+	for (int O = -Radius; O <= Radius; ++O)
 	{
 		int2 P = clamp(Pixel + FilterDirection * O, ViewRectMin, ViewRectMin + ViewSize - 1);
-		float S = DepthIn.Load(int3(P, 0));
-		if (S >= NO_FLUID_DEPTH)
+		float Z = GuideDepth.Load(int3(P, 0));
+		if (Z >= NO_FLUID_DEPTH)
 		{
 			continue;
 		}
-		float Dd = (S - Center) / DepthFalloff;
-		float W = exp(-float(O * O) / (2.0 * Sigma * Sigma)) * exp(-Dd * Dd);
+		float S = DepthIn.Load(int3(P, 0));
+		float W = exp(-float(O * O) / (2.0 * Sigma * Sigma));
+		if (DepthFalloff > 0.0)
+		{
+			float Planar = Slope * float(O);
+			float Dd = (Z - CenterZ - Planar) / DepthFalloff;
+			W *= exp(-Dd * Dd);
+			S -= Planar;
+		}
 		Sum += S * W;
 		WSum += W;
 	}
@@ -199,6 +550,10 @@ void CompositeCS(uint3 DTid : SV_DispatchThreadID)
 	float3 Ddx = abs(Px1.z - P.z) < abs(P.z - Px0.z) ? Px1 - P : P - Px0;
 	float3 Ddy = abs(Py1.z - P.z) < abs(P.z - Py0.z) ? Py1 - P : P - Py0;
 	float3 N = normalize(cross(Ddy, Ddx));
+	if (bHasFluidNormal != 0u)
+	{
+		N = FluidNormal.Load(int3(Pixel, 0)).xyz;
+	}
 	if (N.z > 0.0)
 	{
 		N = -N;
@@ -218,7 +573,11 @@ void CompositeCS(uint3 DTid : SV_DispatchThreadID)
 	}
 	float3 Behind = SceneColorTexture.Load(int3(RefractPixel, 0)).rgb;
 	float3 Transmittance = exp(-AbsorptionPerMeter * ThicknessCm * 0.01);
-	float3 Refracted = Behind * Transmittance + ScatterColor * (1.0 - Transmittance);
+	// In-scattered colour is lit with a wrapped diffuse term so thick (opaque) liquids keep their shape
+	// instead of reading as flat colour.
+	float Wrap = saturate(dot(N, -LightDirectionView) * 0.5 + 0.5);
+	float3 ScatterLit = ScatterColor * (0.4 + 0.6 * Wrap * Wrap);
+	float3 Refracted = Behind * Transmittance + ScatterLit * (1.0 - Transmittance);
 
 	float3 R = reflect(-V, N);
 	float3 Rw = normalize(mul(float4(R, 0.0), ViewToWorld).xyz);
@@ -226,5 +585,6 @@ void CompositeCS(uint3 DTid : SV_DispatchThreadID)
 	float3 Spec = LightColor * pow(saturate(dot(R, -LightDirectionView)), SpecularPower);
 
 	float3 Color = lerp(Refracted, Sky, Fresnel) + Spec * Fresnel;
-	OutputColor[Pixel] = float4(Color, Scene.a);
+	float Coverage = EdgeFadeThickness > 0.0 ? smoothstep(0.0, EdgeFadeThickness, ThicknessCm) : 1.0;
+	OutputColor[Pixel] = float4(lerp(Scene.rgb, Color, Coverage), Scene.a);
 }

@@ -3,7 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Engine/DataAsset.h"
+#include "SloshMaterialAsset.h"
 #include "SloshPaintPreset.generated.h"
 
 class UMaterialInterface;
@@ -62,9 +62,12 @@ struct SLOSH_API FSloshPaintLayer
  * A paintable liquid: how strokes become geometry (thickness, flatness, drops, layers) and how they are shaded.
  * Parameters mirror the Blender Fluid Painter add-on's geometry-node inputs one-to-one so its presets port
  * directly (PAINTER_DESIGN.md). Lengths are in preset units: Scale x 1 mm.
+ *
+ * Every preset is also a Slosh liquid material (USloshMaterialAsset): assign it to a SloshVolume's Material
+ * slot and the simulation uses its Physical and Visual sections, tuned to match the painted look.
  */
 UCLASS(BlueprintType)
-class SLOSH_API USloshPaintPreset : public UDataAsset
+class SLOSH_API USloshPaintPreset : public USloshMaterialAsset
 {
 	GENERATED_BODY()
 

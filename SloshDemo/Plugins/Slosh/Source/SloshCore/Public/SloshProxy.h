@@ -42,6 +42,7 @@ public:
 	uint32 GetNumParticles_RenderThread() const { return NumParticles; }
 	const FTransform& GetSimToWorld_RenderThread() const { return SimToWorld; }
 	float GetCellSize_RenderThread() const { return Layout.CellSize; }
+	FIntVector GetGridDim_RenderThread() const { return Layout.GridDim; }
 
 private:
 	void Allocate(FRDGBuilder& GraphBuilder, const FSloshSolverSettings& Settings);
@@ -58,6 +59,7 @@ private:
 		uint64 Frame = 0;
 		int32 Substeps = 0;
 		int32 NumColliders = 0;
+		uint64 TotalEmittedAtSubmit = 0;   // to rebuild the particle bound from the GPU count read back
 		bool bPending = false;
 	};
 
@@ -82,6 +84,7 @@ private:
 
 	TRefCountPtr<FRDGPooledBuffer> ParticleBuffer;
 	TRefCountPtr<FRDGPooledBuffer> ParticleSortBuffer;   // ping-pong target of the spatial sort
+	TRefCountPtr<FRDGPooledBuffer> ParticleCountBuffer;  // [0] slots in use (GPU-exact), [1] emission base
 	TRefCountPtr<FRDGPooledBuffer> SortRankBuffer;
 	TRefCountPtr<FRDGPooledBuffer> SortCountsBuffer;
 	TRefCountPtr<FRDGPooledBuffer> SortOffsetsBuffer;

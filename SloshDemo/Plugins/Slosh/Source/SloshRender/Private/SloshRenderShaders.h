@@ -49,6 +49,61 @@ public:
 	END_SHADER_PARAMETER_STRUCT()
 };
 
+class FSloshAnisoBinCS : public FSloshRenderShaderBase
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSloshAnisoBinCS);
+	SHADER_USE_PARAMETER_STRUCT(FSloshAnisoBinCS, FSloshRenderShaderBase);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(uint32, NumParticles)
+		SHADER_PARAMETER(float, BinSize)
+		SHADER_PARAMETER(uint32, TableMask)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FSloshParticlePacked>, Particles)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, HashKeys)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, HashMoments)
+	END_SHADER_PARAMETER_STRUCT()
+};
+
+class FSloshAnisoComputeCS : public FSloshRenderShaderBase
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSloshAnisoComputeCS);
+	SHADER_USE_PARAMETER_STRUCT(FSloshAnisoComputeCS, FSloshRenderShaderBase);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(uint32, NumParticles)
+		SHADER_PARAMETER(float, BinSize)
+		SHADER_PARAMETER(uint32, TableMask)
+		SHADER_PARAMETER(float, SplatRadiusSim)
+		SHADER_PARAMETER(float, AnisoStrength)
+		SHADER_PARAMETER(float, AnisoMaxStretch)
+		SHADER_PARAMETER(float, AnisoSmoothing)
+		SHADER_PARAMETER(float, AnisoMinNeighbours)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FSloshParticlePacked>, Particles)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, HashKeys)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, HashMoments)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, Ellipsoids)
+	END_SHADER_PARAMETER_STRUCT()
+};
+
+class FSloshSplatEllipsoidsCS : public FSloshRenderShaderBase
+{
+public:
+	DECLARE_GLOBAL_SHADER(FSloshSplatEllipsoidsCS);
+	SHADER_USE_PARAMETER_STRUCT(FSloshSplatEllipsoidsCS, FSloshRenderShaderBase);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER_STRUCT_INCLUDE(FSloshRenderViewParameters, View)
+		SHADER_PARAMETER(uint32, NumParticles)
+		SHADER_PARAMETER(float, MaxSplatPixels)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, EllipsoidsIn)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, FluidDepthUint)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint>, FluidThicknessUint)
+	END_SHADER_PARAMETER_STRUCT()
+};
+
 class FSloshResolveCS : public FSloshRenderShaderBase
 {
 public:
@@ -74,8 +129,10 @@ public:
 		SHADER_PARAMETER_STRUCT_INCLUDE(FSloshRenderViewParameters, View)
 		SHADER_PARAMETER(FIntPoint, FilterDirection)
 		SHADER_PARAMETER(int32, FilterRadius)
+		SHADER_PARAMETER(float, RadiusPerViewZ)
 		SHADER_PARAMETER(float, DepthFalloff)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, DepthIn)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, GuideDepth)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, DepthOut)
 	END_SHADER_PARAMETER_STRUCT()
 };
@@ -97,6 +154,9 @@ public:
 		SHADER_PARAMETER(float, RefractionStrength)
 		SHADER_PARAMETER(float, SpecularPower)
 		SHADER_PARAMETER(float, FresnelF0)
+		SHADER_PARAMETER(float, EdgeFadeThickness)
+		SHADER_PARAMETER(uint32, bHasFluidNormal)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, FluidNormal)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, FluidDepth)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float>, FluidThickness)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneColorTexture)

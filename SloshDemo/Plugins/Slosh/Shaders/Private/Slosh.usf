@@ -25,6 +25,8 @@ float  FlipRatio;
 uint   bUseAPIC;
 float  MaxSpeed;
 float  Friction;
+float  AdhesionAccel;   // m/s^2 toward the surface at contact
+float  AdhesionRange;   // m beyond ParticleRadius
 float  ParticleRadius;
 float  ViscosityAlpha;
 float  SORWeight;
@@ -53,6 +55,14 @@ float3 EmitExtent;
 float3 EmitVelocity;
 int3   EmitCellMin;
 int3   EmitCellDims;
+uint   EmitBound;           // particle slots in use before this emission (CPU upper bound)
+float4 EmitRotation;        // box emitter orientation
+float  EmitSpread;          // velocity cone half angle, radians
+float  EmitSpeedJitter;     // +- fraction of the speed
+uint   NumManipulators;
+uint   FrameSeed;
+StructuredBuffer<FSloshManipulator> Manipulators;
+RWStructuredBuffer<uint> ParticleCount;   // [0] slots in use (exact, GPU), [1] base of the current emission
 
 RWStructuredBuffer<FSloshParticlePacked> Particles;
 RWStructuredBuffer<float> Vel;       // current face velocities
@@ -236,11 +246,37 @@ float ParticleSpacingJitter(uint H)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Emission: writes EmitCount particles into a ring buffer starting at EmitCursor.
+// Emission reserves EmitCount slots at the GPU particle count (EmitReserveCS, one thread), then writes them
+// (EmitParticlesCS). Slots between the new count and the CPU bound are marked dead so a slot never written in
+// this buffer can enter the live range. Compaction (the spatial sort) moves dead particles behind the live ones.
 //   EmitMode 0: stratified fill of a cell box (8 particles per cell, jittered 2x2x2)
 //   EmitMode 1: random points in a sphere (EmitCenter, radius EmitExtent.x)
 //   EmitMode 2: random points in an axis-aligned box (EmitCenter +- EmitExtent)
 // ---------------------------------------------------------------------------------------------
+FSloshParticlePacked DeadParticlePacked()
+{
+	FSloshParticle Dead = (FSloshParticle)0;
+	Dead.Age = -1.0;
+	return PackParticle(Dead);
+}
+
+// End of frame: fold this frame's drained count into the running total and expose both counts to the readback.
+[numthreads(1, 1, 1)]
+void AccumulateStatsCS()
+{
+	ParticleCount[2] += Stats[15];
+	Stats[14] = ParticleCount[0];
+	Stats[15] = ParticleCount[2];
+}
+
+[numthreads(1, 1, 1)]
+void EmitReserveCS()
+{
+	uint Base = ParticleCount[0];
+	ParticleCount[1] = Base;
+	ParticleCount[0] = Base + EmitCount;
+}
+
 [numthreads(SLOSH_THREADS, 1, 1)]
 void EmitParticlesCS(uint3 DTid : SV_DispatchThreadID)
 {
@@ -248,6 +284,12 @@ void EmitParticlesCS(uint3 DTid : SV_DispatchThreadID)
 	if (I >= EmitCount)
 	{
 		return;
+	}
+	const uint Base = ParticleCount[1];
+	const uint Fill = EmitBound + I;
+	if (Fill >= Base + EmitCount && Fill < ParticleCapacity)
+	{
+		Particles[Fill] = DeadParticlePacked();
 	}
 
 	uint H0 = PcgHash(I * 3u + EmitSeed * 7919u);
@@ -280,20 +322,38 @@ void EmitParticlesCS(uint3 DTid : SV_DispatchThreadID)
 	}
 	else
 	{
-		P = EmitCenter + (2.0 * Rnd - 1.0) * EmitExtent;
+		P = EmitCenter + QuatRotate(EmitRotation, (2.0 * Rnd - 1.0) * EmitExtent);
 	}
 
 	float3 Lo = CellSize * 1.01;
 	float3 Hi = (float3(GridDim) - 1.01) * CellSize;
 
+	// Velocity: optional cone spread around the emit direction and +- speed variation.
+	float3 Velocity = EmitVelocity;
+	float Speed = length(EmitVelocity);
+	if (Speed > 1e-6 && (EmitSpread > 0.0 || EmitSpeedJitter > 0.0))
+	{
+		uint H4 = PcgHash(H2 ^ 0x9E3779B9u);
+		uint H5 = PcgHash(H4);
+		uint H6 = PcgHash(H5);
+		float3 Dir = EmitVelocity / Speed;
+		float3 T0 = normalize(cross(Dir, abs(Dir.z) < 0.9 ? float3(0, 0, 1) : float3(1, 0, 0)));
+		float3 T1 = cross(Dir, T0);
+		float CosA = lerp(1.0, cos(EmitSpread), HashToUnitFloat(H4));
+		float SinA = sqrt(saturate(1.0 - CosA * CosA));
+		float Phi = 6.28318530718 * HashToUnitFloat(H5);
+		Dir = CosA * Dir + SinA * (cos(Phi) * T0 + sin(Phi) * T1);
+		Velocity = Dir * Speed * max(1.0 + EmitSpeedJitter * (2.0 * HashToUnitFloat(H6) - 1.0), 0.0);
+	}
+
 	FSloshParticle Particle;
 	Particle.Pos = clamp(P, Lo, Hi);
-	Particle.Vel = EmitVelocity;
+	Particle.Vel = Velocity;
 	Particle.Cx = 0;
 	Particle.Cy = 0;
 	Particle.Cz = 0;
 	Particle.Age = 0;
-	Particles[(EmitCursor + I) % ParticleCapacity] = PackParticle(Particle);
+	Particles[Base + I] = PackParticle(Particle);
 	BrickTouch[BrickIndexOf(clamp(int3(floor(Particle.Pos * InvCellSize)), 0, GridDim - 1) >> 3)] = 1u;   // brick pool
 }
 
@@ -451,6 +511,10 @@ void P2GCS(uint3 DTid : SV_DispatchThreadID, uint GroupThread : SV_GroupIndex)
 	if (bValid)
 	{
 		P = UnpackParticle(Particles[I]);
+		bValid = !IsDeadParticleAge(P.Age);
+	}
+	if (bValid)
+	{
 		Cell = clamp(int3(floor(P.Pos * InvCellSize)), 0, GridDim - 1);
 		// Stencil nodes span [cell - 1, cell + 1] per axis across the three staggered components.
 		InterlockedMin(TileOrigin[0], Cell.x - 1);
@@ -1388,6 +1452,10 @@ float3 SampleVelocity(float3 Xp, float3 Fallback, bool bCheckKnown)
 uint AdvectParticle(uint I)
 {
 	FSloshParticle P = UnpackParticle(Particles[I]);
+	if (IsDeadParticleAge(P.Age))
+	{
+		return SLOSH_NO_BRICK;
+	}
 	float3 Lo = CellSize * 1.01;
 	float3 Hi = (float3(GridDim) - 1.01) * CellSize;
 
@@ -1452,12 +1520,61 @@ uint AdvectParticle(uint I)
 		P.Cz = 0;
 	}
 
-	// Collider response: project out of penetrating SDFs, remove inward relative normal velocity,
-	// apply Coulomb-like tangential friction relative to the moving surface.
+	// Force fields (ZibraLiquids-style manipulators): full strength inside the shape, fading out over Falloff.
+	for (uint M = 0; M < NumManipulators; ++M)
+	{
+		FSloshManipulator F = Manipulators[M];
+		if (F.Kind == MANIP_DRAIN)
+		{
+			continue;
+		}
+		float W = ManipulatorWeight(F, X);
+		if (W <= 0.0)
+		{
+			continue;
+		}
+		float3 R = X - F.Center;
+		if (F.Kind == MANIP_DIRECTIONAL)
+		{
+			NewVel += F.Axis * (F.Strength * W * Dt);
+		}
+		else if (F.Kind == MANIP_RADIAL)
+		{
+			NewVel += (length(R) > 1e-5 ? normalize(R) : float3(0, 0, 0)) * (F.Strength * W * Dt);
+		}
+		else if (F.Kind == MANIP_SWIRL)
+		{
+			float3 Perp = R - dot(R, F.Axis) * F.Axis;
+			float PerpLen = length(Perp);
+			if (PerpLen > 1e-5)
+			{
+				float3 Tangent = cross(F.Axis, Perp / PerpLen);
+				NewVel += (Tangent - (Perp / PerpLen) * F.Param0) * (F.Strength * W * Dt);
+			}
+		}
+		else if (F.Kind == MANIP_DRAG)
+		{
+			NewVel *= exp(-F.Strength * W * Dt);
+		}
+	}
+
+	// Collider response: adhesion pulls particles within AdhesionRange of a surface toward it (linear falloff,
+	// relative to the moving surface), then penetrating particles are projected out, inward relative normal
+	// velocity is removed and Coulomb-like tangential friction applies.
 	for (uint K = 0; K < NumColliders; ++K)
 	{
 		FSloshCollider C = Colliders[K];
 		float D = ColliderSDF(C, X);
+		if (AdhesionAccel > 0.0 && D < ParticleRadius + AdhesionRange)
+		{
+			float3 N = ColliderNormal(C, X, 0.25 * CellSize);
+			float W = saturate(1.0 - (D - ParticleRadius) / AdhesionRange);
+			float3 Vs = ColliderVelocityAt(C, X);
+			float Vn = dot(NewVel - Vs, N);
+			// Only slow separation (and add a little approach): never accelerate particles into the body beyond
+			// what one substep of contact can absorb.
+			NewVel -= N * min(AdhesionAccel * W * Dt, max(Vn, 0.0) + AdhesionAccel * W * Dt * 0.25);
+		}
 		if (D < ParticleRadius)
 		{
 			float3 N = ColliderNormal(C, X, 0.25 * CellSize);
@@ -1474,7 +1591,9 @@ uint AdvectParticle(uint I)
 		}
 	}
 
-	// Domain walls.
+	// Domain walls. Particles in contact get the same tangential friction as at colliders, so viscous liquids
+	// pool on the floor instead of sliding out into a single sparse particle layer.
+	uint WallContact = 0u;
 	[unroll]
 	for (uint Axis = 0; Axis < 3; ++Axis)
 	{
@@ -1482,11 +1601,24 @@ uint AdvectParticle(uint I)
 		{
 			X[Axis] = Lo[Axis];
 			NewVel[Axis] = max(NewVel[Axis], 0.0);
+			WallContact |= 1u << Axis;
 		}
 		else if (X[Axis] > Hi[Axis])
 		{
 			X[Axis] = Hi[Axis];
 			NewVel[Axis] = min(NewVel[Axis], 0.0);
+			WallContact |= 1u << Axis;
+		}
+	}
+	if (WallContact != 0u && Friction > 0.0)
+	{
+		[unroll]
+		for (uint Axis = 0; Axis < 3; ++Axis)
+		{
+			if ((WallContact & (1u << Axis)) == 0u)
+			{
+				NewVel[Axis] *= 1.0 - Friction;
+			}
 		}
 	}
 
@@ -1501,6 +1633,23 @@ uint AdvectParticle(uint I)
 		if (TypeOf(GetCellType(int3(floor(P.Pos * InvCellSize)))) == CELL_SOLID)
 		{
 			InterlockedAdd(Stats[13], 1u);
+		}
+	}
+
+	// Drains: remove particles inside (RemovalRate 0 = at once, else with probability 1 - exp(-rate dt)).
+	for (uint Dr = 0; Dr < NumManipulators; ++Dr)
+	{
+		FSloshManipulator F = Manipulators[Dr];
+		if (F.Kind != MANIP_DRAIN || ManipulatorSDF(F, X) > 0.0)
+		{
+			continue;
+		}
+		float Chance = F.Param0 > 0.0 ? 1.0 - exp(-F.Param0 * Dt) : 1.0;
+		if (Chance >= 1.0 || HashToUnitFloat(PcgHash(I * 2654435761u + FrameSeed * 97u + Dr)) < Chance)
+		{
+			Particles[I] = DeadParticlePacked();
+			InterlockedAdd(Stats[15], 1u);
+			return SLOSH_NO_BRICK;
 		}
 	}
 

@@ -6,6 +6,18 @@
 #include "SloshProxy.h"
 
 class FSceneInterface;
+class FSloshSurfaceMeshBuffers;
+
+/** How a volume's liquid surface is produced. */
+enum class ESloshSurfaceRenderMode : uint8
+{
+	/** Screen-space particle splats (spheres or anisotropic ellipsoids) with depth smoothing. */
+	Splats,
+	/** A density field built from the particles, ray-marched per pixel: smooth by construction. */
+	Raymarch,
+	/** The same field turned into a GPU triangle mesh (surface nets), drawn with a UE material. */
+	Mesh,
+};
 
 /** Visual parameters for one liquid volume (render thread copy). */
 struct FSloshRenderSettings
@@ -20,7 +32,19 @@ struct FSloshRenderSettings
 	float FresnelF0 = 0.02f;
 	float SpecularPower = 400.0f;
 	float ParticleRadiusScale = 0.6f;
-	int32 SmoothingRadius = 7;
+	int32 SmoothingRadius = 24;
+	float SmoothingScale = 4.0f;
+	int32 SmoothingIterations = 3;
+	float EdgeFadeThickness = 1.5f;
+	float Anisotropy = 0.85f;            // 0 = sphere splats
+	float AnisotropyMaxStretch = 4.0f;
+	float AnisotropySmoothing = 0.5f;
+	ESloshSurfaceRenderMode SurfaceMode = ESloshSurfaceRenderMode::Splats;
+	float FieldResolution = 1.0f;        // field voxels per solver cell
+	float SurfaceSmoothing = 2.0f;       // field kernel radius in splat radii
+	float IsoLevel = 0.5f;               // surface threshold: 0.5 = particle radius, lower = fatter, higher = thinner
+	FVector3f LocalOffsetCm = FVector3f::ZeroVector;   // volume-local cm of the sim-space origin (mesh mode)
+	TSharedPtr<FSloshSurfaceMeshBuffers, ESPMode::ThreadSafe> MeshBuffers;   // mesh mode
 	bool bEnabled = true;
 };
 

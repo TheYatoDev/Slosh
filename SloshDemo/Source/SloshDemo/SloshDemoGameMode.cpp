@@ -2,6 +2,7 @@
 #include "SloshVolume.h"
 #include "SloshColliderComponent.h"
 #include "SloshEmitterComponent.h"
+#include "SloshManipulatorComponent.h"
 #include "Camera/CameraActor.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
@@ -28,10 +29,28 @@
 #include "Materials/MaterialInterface.h"
 #include "Components/PoseableMeshComponent.h"
 #include "SloshSkeletalColliderComponent.h"
+#include "SloshSkelTestActors.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogSloshDemo, Log, All);
 
 IMPLEMENT_PRIMARY_GAME_MODULE(FDefaultGameModuleImpl, SloshDemo, "SloshDemo");
+
+namespace
+{
+	// -SloshSurface=Splats|Raymarched|Mesh  -SloshIso=  -SloshFieldRes=  -SloshSurfaceSmoothing=
+	void ApplySurfaceFlags(ASloshVolume* Target)
+	{
+		FString Mode;
+		if (FParse::Value(FCommandLine::Get(), TEXT("SloshSurface="), Mode))
+		{
+			Target->SurfaceMode = Mode.StartsWith(TEXT("Ray"), ESearchCase::IgnoreCase) ? ESloshSurfaceMode::Raymarched
+				: Mode.Equals(TEXT("Mesh"), ESearchCase::IgnoreCase) ? ESloshSurfaceMode::Mesh : ESloshSurfaceMode::Splats;
+		}
+		FParse::Value(FCommandLine::Get(), TEXT("SloshIso="), Target->SurfaceIsoLevel);
+		FParse::Value(FCommandLine::Get(), TEXT("SloshFieldRes="), Target->FieldResolution);
+		FParse::Value(FCommandLine::Get(), TEXT("SloshSurfaceSmoothing="), Target->SurfaceSmoothing);
+	}
+}
 
 ASloshDemoGameMode::ASloshDemoGameMode()
 {
@@ -84,6 +103,16 @@ void ASloshDemoGameMode::StartPlay()
 		StartSkelTest();
 		return;
 	}
+	for (TActorIterator<ASloshVolume> It(World); It; ++It)
+	{
+		Volume = *It;
+		bPlacedScene = true;
+		ApplySurfaceFlags(Volume);
+		AutoTestSeconds = FMath::Max(AutoTestSeconds, 13.0);
+		UE_LOG(LogSloshDemo, Display, TEXT("placed scene: using %s (grid %s, cell %.2f cm); demo scene not spawned"),
+			*Volume->GetName(), *Volume->GridResolution.ToString(), Volume->CellSize);
+		return;
+	}
 
 	FActorSpawnParameters Params;
 	Params.bDeferConstruction = true;
@@ -129,6 +158,10 @@ void ASloshDemoGameMode::StartPlay()
 	{
 		Volume->bTwoSidedDensityProjection = false;   // previous one-sided velocity correction (A/B testing)
 	}
+	if (FParse::Param(FCommandLine::Get(), TEXT("SloshNoAniso")))
+	{
+		Volume->Visual.Anisotropy = 0.0f;   // round splats (A/B rendering comparisons)
+	}
 	if (FParse::Param(FCommandLine::Get(), TEXT("SloshNoDensityCorrection")))
 	{
 		Volume->Physical.DensityCorrection = 0.0f;   // isolates pressure-solver accuracy in the divergence metric
@@ -149,6 +182,7 @@ void ASloshDemoGameMode::StartPlay()
 		Volume->InitialFillBox = FBox(FVector(-HalfSize.X, -HalfSize.Y, -HalfSize.Z), FVector(HalfSize.X, HalfSize.Y, -HalfSize.Z + 5.0 + CalmDepth));
 		Volume->ParticleCapacity = Volume->GridResolution.X * Volume->GridResolution.Y * Volume->GridResolution.Z * 4;
 	}
+	ApplySurfaceFlags(Volume);
 	UGameplayStatics::FinishSpawningActor(Volume, FTransform(FVector(0, 0, 125)));
 
 	// Invisible tank walls so rigid bodies cannot leave the liquid domain (the grid walls only bound the liquid).
@@ -200,7 +234,37 @@ void ASloshDemoGameMode::StartPlay()
 	Emitter->Radius = 8.0f;
 	Emitter->ParticlesPerSecond = 6000.0f;
 	Emitter->Speed = 250.0f;
+	// -SloshManipTest: a spread jet, a floor drain in one corner and a whirlpool in the pool.
+	const bool bManipTest = FParse::Param(FCommandLine::Get(), TEXT("SloshManipTest"));
+	if (bManipTest)
+	{
+		Emitter->VelocitySpread = 12.0f;
+		Emitter->SpeedVariation = 0.2f;
+	}
 	Emitter->RegisterComponent();
+	if (bManipTest)
+	{
+		AActor* Manipulators = World->SpawnActor<AActor>(FVector::ZeroVector, FRotator::ZeroRotator);
+		USceneComponent* ManipRoot = NewObject<USceneComponent>(Manipulators);
+		Manipulators->SetRootComponent(ManipRoot);
+		ManipRoot->RegisterComponent();
+		USloshDrainComponent* Drain = NewObject<USloshDrainComponent>(Manipulators, TEXT("Drain"));
+		Drain->SetupAttachment(ManipRoot);
+		Drain->SetRelativeLocation(FVector(110, 110, 15));
+		Drain->Radius = 30.0f;
+		Drain->bDrawShape = true;
+		Drain->RegisterComponent();
+		USloshForceFieldComponent* Swirl = NewObject<USloshForceFieldComponent>(Manipulators, TEXT("Whirlpool"));
+		Swirl->SetupAttachment(ManipRoot);
+		Swirl->SetRelativeLocation(FVector(-40, -40, 40));
+		Swirl->ForceType = ESloshForceType::Swirl;
+		Swirl->Radius = 90.0f;
+		Swirl->Strength = 600.0f;
+		Swirl->SwirlInwardPull = 0.3f;
+		Swirl->Falloff = 30.0f;
+		Swirl->bDrawShape = true;
+		Swirl->RegisterComponent();
+	}
 	}
 
 	ACameraActor* Camera = World->SpawnActor<ACameraActor>(FVector(380, -420, 330), FRotator::ZeroRotator);
@@ -228,6 +292,11 @@ void ASloshDemoGameMode::Tick(float DeltaSeconds)
 	if (bSkelTest)
 	{
 		TickSkelTest();
+		return;
+	}
+	if (bPlacedScene)
+	{
+		TickPlacedScene();
 		return;
 	}
 
@@ -282,8 +351,8 @@ void ASloshDemoGameMode::Tick(float DeltaSeconds)
 		const USloshColliderComponent* BoxCollider = FloatingBox ? FloatingBox->FindComponentByClass<USloshColliderComponent>() : nullptr;
 		const USloshColliderComponent* SphereCollider = HeavySphere ? HeavySphere->FindComponentByClass<USloshColliderComponent>() : nullptr;
 		UE_LOG(LogSloshDemo, Display,
-			TEXT("t=%.1fs frame=%.2fms (%.1f fps) gpu=%.2fms particles=%d substeps=%d maxSpeed=%.0fcm/s liquid=%.1fL rho=%.4f pvol=%.1fL active=%.2f pool=%.2f ovf=%d mem=%.0f+%.0fMB clamp=%d latency=%d div(mean/max)=%.3f/%.2f 1/s | box z=%.1f sub=%.2f F=%s | sphere z=%.1f sub=%.2f"),
-			Elapsed, AvgMs, 1000.0 / FMath::Max(AvgMs, 0.001), AvgGpuMs, Volume->GetParticleCount(), Volume->GetLastSubstepCount(),
+			TEXT("t=%.1fs frame=%.2fms (%.1f fps) gpu=%.2fms particles=%d drained=%lld substeps=%d maxSpeed=%.0fcm/s liquid=%.1fL rho=%.4f pvol=%.1fL active=%.2f pool=%.2f ovf=%d mem=%.0f+%.0fMB clamp=%d latency=%d div(mean/max)=%.3f/%.2f 1/s | box z=%.1f sub=%.2f F=%s | sphere z=%.1f sub=%.2f"),
+			Elapsed, AvgMs, 1000.0 / FMath::Max(AvgMs, 0.001), AvgGpuMs, Volume->GetParticleCount(), Volume->GetDrainedParticleCount(), Volume->GetLastSubstepCount(),
 			Volume->GetMaxParticleSpeed(), Volume->GetLiquidVolumeLiters(), Volume->GetMeanInteriorDensity(), Volume->GetParticleVolumeLiters(), Volume->GetActiveBrickFraction(),
 			Volume->GetPoolUsage(), Volume->GetPoolOverflowBricks(), Volume->GetGridMemoryMB(), Volume->GetParticleMemoryMB(), Volume->GetClampedParticleCount(),
 			Volume->GetFeedbackLatencyFrames(), Volume->GetMeanDivergence(), Volume->GetMaxDivergence(),
@@ -669,12 +738,20 @@ void ASloshDemoGameMode::StartSkelTest()
 	Volume->Physical.Density = 1400.0f;
 	Volume->Physical.KinematicViscosity = 0.01f;
 	FParse::Value(Cmd, TEXT("SloshSkelViscosity="), Volume->Physical.KinematicViscosity);
+	// -SloshSkelPreset=Honey: a Regular Fluid Painter preset as the liquid (physics, look and mesh material).
+	FString PresetName;
+	if (FParse::Value(Cmd, TEXT("SloshSkelPreset="), PresetName))
+	{
+		Volume->Material = LoadObject<USloshMaterialAsset>(nullptr, *FString::Printf(TEXT("/Slosh/Paint/Presets/Regular/DA_SloshPaint_%s.DA_SloshPaint_%s"), *PresetName, *PresetName));
+		UE_LOG(LogSloshDemo, Display, TEXT("skel test: preset %s %s"), *PresetName, Volume->Material ? TEXT("loaded") : TEXT("MISSING"));
+	}
 	Volume->Physical.Transfer = ESloshTransfer::APIC;
 	Volume->Physical.BoundaryFriction = 0.9f;
 	Volume->Visual.AbsorptionPerMeter = FVector(6.0, 18.0, 60.0);
 	Volume->Visual.ScatterColor = FLinearColor(0.35f, 0.17f, 0.02f);
 	Volume->Visual.FresnelF0 = 0.04f;
 	Volume->Visual.SpecularPower = 250.0f;
+	ApplySurfaceFlags(Volume);
 	UGameplayStatics::FinishSpawningActor(Volume, FTransform(DomainCenter));
 
 	AStaticMeshActor* Floor = World->SpawnActor<AStaticMeshActor>(FVector(DomainCenter.X, DomainCenter.Y, 0), FRotator::ZeroRotator);
@@ -766,5 +843,43 @@ void ASloshDemoGameMode::TickSkelTest()
 	if (bAutoTest && Elapsed > AutoTestSeconds)
 	{
 		FPlatformMisc::RequestExit(false, TEXT("SloshSkelTest"));
+	}
+}
+
+void ASloshDemoGameMode::TickPlacedScene()
+{
+	FrameTimeAccum += GetWorld()->GetDeltaSeconds();
+	GpuTimeAccum += FPlatformTime::ToMilliseconds(RHIGetGPUFrameCycles());
+	++FrameCount;
+	if (Elapsed >= NextLog && Volume)
+	{
+		NextLog += 1.0;
+		FString Wet;
+		for (TActorIterator<ASloshSkelTestCharacter> It(GetWorld()); It; ++It)
+		{
+			int32 Count = 0;
+			const FString Bones = It->DescribeWetBones(Count);
+			Wet += FString::Printf(TEXT(" | %s wet %d/%d:%s"), *It->GetActorNameOrLabel(), Count, It->SloshCollider->GetColliders().Num(), *Bones);
+		}
+		const double AvgMs = FrameTimeAccum / FMath::Max(FrameCount, 1) * 1000.0;
+		UE_LOG(LogSloshDemo, Display, TEXT("placed t=%.1fs frame=%.2fms gpu=%.2fms particles=%d substeps=%d maxSpeed=%.0fcm/s liquid=%.2fL clamp=%d%s"),
+			Elapsed, AvgMs, GpuTimeAccum / FMath::Max(FrameCount, 1), Volume->GetParticleCount(), Volume->GetLastSubstepCount(), Volume->GetMaxParticleSpeed(),
+			Volume->GetLiquidVolumeLiters(), Volume->GetClampedParticleCount(), *Wet);
+		FrameTimeAccum = 0.0;
+		GpuTimeAccum = 0.0;
+		FrameCount = 0;
+	}
+	if (bAutoTest)
+	{
+		const double Shots[] = { 3.0, 6.0, 9.0, 12.5 };
+		if (SkelTestStage < int32(UE_ARRAY_COUNT(Shots)) && Elapsed > Shots[SkelTestStage])
+		{
+			FScreenshotRequest::RequestScreenshot(FPaths::ProjectSavedDir() / TEXT("Bench") / FString::Printf(TEXT("Placed_%c.png"), TCHAR('A' + SkelTestStage)), false, false);
+			++SkelTestStage;
+		}
+		if (Elapsed > AutoTestSeconds)
+		{
+			FPlatformMisc::RequestExit(false, TEXT("SloshAutoTest"));
+		}
 	}
 }

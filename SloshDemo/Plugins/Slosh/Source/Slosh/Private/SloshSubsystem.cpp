@@ -5,6 +5,7 @@
 #include "SloshRenderer.h"
 #include "SloshColliderComponent.h"
 #include "SloshEmitterComponent.h"
+#include "SloshManipulatorComponent.h"
 #include "Engine/World.h"
 
 USloshSubsystem* USloshSubsystem::Get(const UWorld* World)
@@ -18,6 +19,8 @@ void USloshSubsystem::RegisterCollider(USloshColliderComponent* Collider) { Coll
 void USloshSubsystem::UnregisterCollider(USloshColliderComponent* Collider) { Colliders.Remove(Collider); }
 void USloshSubsystem::RegisterEmitter(USloshEmitterComponent* Emitter) { Emitters.AddUnique(Emitter); }
 void USloshSubsystem::UnregisterEmitter(USloshEmitterComponent* Emitter) { Emitters.Remove(Emitter); }
+void USloshSubsystem::RegisterManipulator(USloshManipulatorComponent* Manipulator) { Manipulators.AddUnique(Manipulator); }
+void USloshSubsystem::UnregisterManipulator(USloshManipulatorComponent* Manipulator) { Manipulators.Remove(Manipulator); }
 
 ASloshVolume* USloshSubsystem::FindVolumeAt(FVector WorldLocation) const
 {

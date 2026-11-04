@@ -45,6 +45,10 @@ private:
 	UPROPERTY()
 	TObjectPtr<class USloshSkeletalColliderComponent> SkelColliders;
 
+	/** A level that already contains a SloshVolume is used as-is: no demo scene, just stats (and -SloshAutoTest captures). */
+	void TickPlacedScene();
+	bool bPlacedScene = false;
+
 	FName SkelArmBone;
 	FQuat SkelArmRefCS = FQuat::Identity;
 	FVector SkelSwingAxis = FVector::ForwardVector;

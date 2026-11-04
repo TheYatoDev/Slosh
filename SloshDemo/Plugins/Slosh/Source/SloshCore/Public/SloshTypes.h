@@ -43,6 +43,42 @@ struct FSloshColliderGPU
 };
 static_assert(sizeof(FSloshColliderGPU) == 80, "FSloshColliderGPU must match the HLSL layout");
 
+/** Kinds of particle manipulator (ZibraLiquids-style). Must match SloshCommon.ush. */
+enum class ESloshManipulatorKind : uint32
+{
+	Drain = 0,        // removes particles inside the shape
+	Directional = 1,  // constant acceleration along Axis
+	Radial = 2,       // acceleration away from (Strength > 0) or toward (< 0) the centre
+	Swirl = 3,        // acceleration around Axis, plus an optional pull toward the axis
+	Drag = 4,         // damps velocity at Strength (1/s)
+};
+
+/** Manipulator shape: the collider shapes plus "everywhere" (the whole domain). */
+enum class ESloshManipulatorShape : uint32
+{
+	Sphere = 0,
+	Box = 1,
+	Capsule = 2,
+	Everywhere = 3,
+};
+
+/** Must match FSloshManipulator in SloshCommon.ush (80 bytes). Sim space, SI units. */
+struct FSloshManipulatorGPU
+{
+	FVector3f Center = FVector3f::ZeroVector;
+	uint32 Kind = 0;
+	FVector4f Rotation = FVector4f(0, 0, 0, 1);
+	FVector3f Extent = FVector3f::ZeroVector;   // sphere: x = radius; box: half extents; capsule: radius, half height
+	uint32 Shape = 0;
+	FVector3f Axis = FVector3f(0, 0, 1);         // unit, sim space (Directional, Swirl)
+	float Strength = 0.0f;                       // m/s^2 (Drag: 1/s)
+	float Falloff = 0.0f;                        // m beyond the shape over which the effect fades out
+	float Param0 = 0.0f;                         // Drain: removal rate 1/s (0 = instant); Swirl: inward pull ratio
+	float Param1 = 0.0f;
+	uint32 Pad = 0;
+};
+static_assert(sizeof(FSloshManipulatorGPU) == 80, "FSloshManipulatorGPU must match the HLSL layout");
+
 /** Must match FSloshParticle in SloshCommon.ush (64 bytes). */
 // Stored particle (HLSL FSloshParticlePacked): the APIC affine matrix is 9 halves in C.
 struct FSloshParticleGPU
@@ -57,6 +93,7 @@ static_assert(sizeof(FSloshParticleGPU) == 48, "FSloshParticleGPU must match the
 namespace Slosh
 {
 	constexpr uint32 MaxColliders = 64;
+	constexpr uint32 MaxManipulators = 32;
 	constexpr uint32 CouplingStride = 16;
 	constexpr float CouplingFixedScale = 1024.0f;
 	constexpr uint32 ColliderFlagTwoWay = 1u;
@@ -84,6 +121,8 @@ struct FSloshSolverSettings
 	float Density = 1000.0f;              // kg/m^3
 	float KinematicViscosity = 0.0f;      // m^2/s
 	float BoundaryFriction = 0.0f;        // 0 = free slip, 1 = no slip (tangential)
+	float Adhesion = 0.0f;                // surface attraction in units of 1.5 g (1 = clings to overhangs)
+	float AdhesionDistance = 0.025f;      // meters beyond contact over which adhesion acts
 	float DensityCorrection = 0.15f;
 	float DensityDeadband = 0.05f;        // velocity correction only: correct above (1 + deadband) x rest density
 	bool bTwoSidedDensityProjection = true; // position-based two-sided correction (replaces the velocity correction)
@@ -133,6 +172,9 @@ struct FSloshEmitRequest
 	FVector3f Center = FVector3f::ZeroVector;   // sim space
 	FVector3f Extent = FVector3f::ZeroVector;   // sphere: x = radius; box: half extents
 	FVector3f Velocity = FVector3f::ZeroVector;
+	FVector4f Rotation = FVector4f(0, 0, 0, 1);  // box orientation (sim space)
+	float VelocitySpread = 0.0f;                 // cone half angle around Velocity, radians
+	float SpeedJitter = 0.0f;                    // +- fraction of the speed
 	FIntVector CellMin = FIntVector::ZeroValue; // FillCells only
 	FIntVector CellDims = FIntVector::ZeroValue;
 	uint32 Count = 0;
@@ -144,6 +186,7 @@ struct FSloshFrameInput
 	FSloshSolverSettings Settings;
 	TArray<FSloshColliderGPU> Colliders;
 	TArray<FSloshEmitRequest> Emits;
+	TArray<FSloshManipulatorGPU> Manipulators;
 	FTransform SimToWorld = FTransform::Identity;   // includes meters -> cm scale
 	float DeltaTime = 1.0f / 60.0f;
 	bool bReset = false;
@@ -180,6 +223,8 @@ struct FSloshResults
 	float GridMemoryMB = 0.0f;         // GPU memory of grid, pool, solver and sort buffers
 	float ParticleMemoryMB = 0.0f;
 	int32 AllocatedParticleCapacity = 0; // particle slots currently allocated (grows on demand up to ParticleCapacity)
+	int32 LiveParticles = -1;            // particles in use on the GPU (removed ones leave after the next compaction)
+	int64 DrainedParticles = 0;          // particles removed by drains since the last reset
 	int32 Substeps = 0;
 	uint64 SimFrame = 0;         // simulation frame these results were produced on
 	uint64 LatestSubmittedFrame = 0;

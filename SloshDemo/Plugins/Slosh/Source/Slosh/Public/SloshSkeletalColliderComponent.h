@@ -59,6 +59,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Coupling")
 	ESloshCouplingMode CouplingMode = ESloshCouplingMode::OneWay;
 
+	/** Read back per-bone wetness (each collider's submerged fraction) even though the mesh is kinematic. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Coupling")
+	bool bReportWetness = false;
+
 	/** Draw the fitted capsules every frame (debug). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Slosh|Debug")
 	bool bDrawCapsules = false;

@@ -1,0 +1,470 @@
+// Copyright notice: see Plugins/Slosh/NOTICE.md.
+// Smooth liquid surfaces from simulation particles (render-only; never writes simulation state).
+//
+//   DensitySplatCS      scatters each particle's (anisotropic) ellipsoid kernel (1 - q^2)^3 into a dense
+//                       fixed-point voxel grid covering the domain.
+//   FieldResolveCS      normalises it by the rest density (interior ~= 1), writes a float 3D texture and
+//                       marks occupied 8^3 bricks (dilated by one voxel) for empty-space skipping.
+//   RaymarchCS          per pixel: skips empty bricks, finds the IsoLevel crossing, refines it by bisection,
+//                       and writes view depth, thickness through the liquid and a smooth gradient normal.
+//   SurfaceNets*CS      naive surface nets on the same field: one vertex per surface cell (mean of the edge
+//                       crossings), one quad per crossing edge, written straight into vertex/index buffers
+//                       drawn indirectly by USloshSurfaceMeshComponent with any UE material.
+
+#include "SloshCommon.ush"
+
+#define NO_FLUID_DEPTH 3.0e38
+#define FIELD_FIXED 1024.0
+#define BRICK_SHIFT 3
+
+int3   FieldDim;
+float  IsoLevel;
+
+uint BrickIndexOfVoxel(int3 V, int3 BrickDimension)
+{
+	int3 B = clamp(V >> BRICK_SHIFT, 0, BrickDimension - 1);
+	return uint(B.x + BrickDimension.x * (B.y + BrickDimension.y * B.z));
+}
+
+uint VoxelIndex(int3 V)
+{
+	return uint(V.x + FieldDim.x * (V.y + FieldDim.y * V.z));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Density splat
+// ---------------------------------------------------------------------------------------------
+// Field = Zhu & Bridson (2005) particle surface: phi(x) = |x - xbar(x)| - rbar(x), with xbar the kernel-weighted
+// mean of nearby particle centres and rbar their radius. Unlike a density threshold it gives every particle a
+// surface at least its own radius thick, so stretched streams, thin coats and drips stay visible, while dense
+// liquid still blends into one smooth surface. Stored as F = saturate(0.5 - 0.5 phi / rbar): 1 deep inside,
+// 0.5 on the particle-radius surface, 0 outside, so IsoLevel 0.5 = surface at the particle radius.
+#define FIELD_MOMENTS 5u
+#define FIELD_W_FIXED 1024.0
+#define FIELD_X_FIXED 256.0
+
+uint   NumParticles;
+float  InvVoxelSize;        // voxels per sim metre
+float  SupportScale;        // kernel support / splat radius
+float  MaxFootprint;        // cap on the kernel radius in voxels
+float  ParticleRadiusVoxels;
+StructuredBuffer<float4> EllipsoidsIn;
+RWStructuredBuffer<int> FieldAccum;
+
+[numthreads(SLOSH_THREADS, 1, 1)]
+void DensitySplatCS(uint3 DTid : SV_DispatchThreadID)
+{
+	uint I = LinearThreadId(DTid, SLOSH_THREADS);
+	if (I >= NumParticles)
+	{
+		return;
+	}
+	if (dot(EllipsoidsIn[I * 4u + 1u].xyz, EllipsoidsIn[I * 4u + 1u].xyz) <= 0.0)
+	{
+		return;   // removed particle
+	}
+	float3 C = EllipsoidsIn[I * 4u].xyz * InvVoxelSize;
+	float3 U0 = EllipsoidsIn[I * 4u + 1u].xyz * (SupportScale * InvVoxelSize);
+	float3 U1 = EllipsoidsIn[I * 4u + 2u].xyz * (SupportScale * InvVoxelSize);
+	float3 U2 = EllipsoidsIn[I * 4u + 3u].xyz * (SupportScale * InvVoxelSize);
+	float A0 = max(dot(U0, U0), 1e-8), A1 = max(dot(U1, U1), 1e-8), A2 = max(dot(U2, U2), 1e-8);
+	float3 W0 = U0 / A0, W1 = U1 / A1, W2 = U2 / A2;
+	float R = min(sqrt(max(A0, max(A1, A2))), MaxFootprint);
+	int3 Lo = max(int3(floor(C - R - 0.5)), 0);
+	int3 Hi = min(int3(ceil(C + R - 0.5)), FieldDim - 1);
+	for (int Z = Lo.z; Z <= Hi.z; ++Z)
+	{
+		for (int Y = Lo.y; Y <= Hi.y; ++Y)
+		{
+			for (int X = Lo.x; X <= Hi.x; ++X)
+			{
+				float3 D = float3(X, Y, Z) + 0.5 - C;
+				float3 Q = float3(dot(D, W0), dot(D, W1), dot(D, W2));
+				float Q2 = dot(Q, Q);
+				if (Q2 < 1.0)
+				{
+					float Wk = 1.0 - Q2;
+					Wk = Wk * Wk * Wk;
+					uint Base = VoxelIndex(int3(X, Y, Z)) * FIELD_MOMENTS;
+					// D points from the particle to the voxel centre; store the particle offset seen from the voxel.
+					InterlockedAdd(FieldAccum[Base + 0u], int(Wk * FIELD_W_FIXED + 0.5));
+					InterlockedAdd(FieldAccum[Base + 1u], int(round(-D.x * Wk * FIELD_X_FIXED)));
+					InterlockedAdd(FieldAccum[Base + 2u], int(round(-D.y * Wk * FIELD_X_FIXED)));
+					InterlockedAdd(FieldAccum[Base + 3u], int(round(-D.z * Wk * FIELD_X_FIXED)));
+					InterlockedAdd(FieldAccum[Base + 4u], int(round(ParticleRadiusVoxels * Wk * FIELD_X_FIXED)));
+				}
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Resolve: fixed point -> normalised float field + brick occupancy
+// ---------------------------------------------------------------------------------------------
+int3   BrickDim;
+StructuredBuffer<int> FieldAccumIn;
+RWTexture3D<float> FieldOut;
+RWStructuredBuffer<uint> BrickOccupancy;
+
+[numthreads(4, 4, 4)]
+void FieldResolveCS(uint3 DTid : SV_DispatchThreadID)
+{
+	int3 V = int3(DTid);
+	if (any(V >= FieldDim))
+	{
+		return;
+	}
+	uint Base = VoxelIndex(V) * FIELD_MOMENTS;
+	float W = float(FieldAccumIn[Base + 0u]) / FIELD_W_FIXED;
+	float F = 0.0;
+	if (W > 1e-3)
+	{
+		float3 MeanOffset = float3(FieldAccumIn[Base + 1u], FieldAccumIn[Base + 2u], FieldAccumIn[Base + 3u]) / (FIELD_X_FIXED * W);
+		float RBar = max(float(FieldAccumIn[Base + 4u]) / (FIELD_X_FIXED * W), 1e-3);
+		float Phi = length(MeanOffset) - RBar;
+		F = saturate(0.5 - 0.5 * Phi / RBar);
+	}
+	FieldOut[V] = F;
+	if (F <= 0.0)
+	{
+		return;
+	}
+	// Mark this voxel's brick and, at brick borders, the bricks of its neighbours (interpolation between this
+	// voxel and the next one can put the surface in the neighbouring brick).
+	int3 InBrick = V & 7;
+	[unroll]
+	for (int K = 0; K < 8; ++K)
+	{
+		int3 O = int3(K & 1, (K >> 1) & 1, K >> 2) * 2 - 1;
+		int3 N = V + O * int3(InBrick.x == (O.x < 0 ? 0 : 7), InBrick.y == (O.y < 0 ? 0 : 7), InBrick.z == (O.z < 0 ? 0 : 7));
+		if (all(N >= 0) && all(N < FieldDim))
+		{
+			InterlockedOr(BrickOccupancy[BrickIndexOfVoxel(N, BrickDim)], 1u);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared field sampling for the consumers
+// ---------------------------------------------------------------------------------------------
+Texture3D<float> Field;
+SamplerState FieldSampler;
+StructuredBuffer<uint> BrickOccupancyIn;
+
+float SampleField(float3 Pv)   // Pv in voxel units (voxel v centre at v + 0.5)
+{
+	return Field.SampleLevel(FieldSampler, Pv / float3(FieldDim), 0);
+}
+
+float3 FieldGradient(float3 Pv)
+{
+	return float3(
+		SampleField(Pv + float3(1, 0, 0)) - SampleField(Pv - float3(1, 0, 0)),
+		SampleField(Pv + float3(0, 1, 0)) - SampleField(Pv - float3(0, 1, 0)),
+		SampleField(Pv + float3(0, 0, 1)) - SampleField(Pv - float3(0, 0, 1)));
+}
+
+bool BrickOccupied(float3 Pv)
+{
+	int3 V = int3(floor(Pv));
+	if (any(V < 0) || any(V >= FieldDim))
+	{
+		return false;
+	}
+	return BrickOccupancyIn[BrickIndexOfVoxel(V, BrickDim)] != 0u;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Raymarch
+// ---------------------------------------------------------------------------------------------
+int2   ViewRectMin;
+int2   ViewSize;
+float4x4 SimToView;
+float4x4 ViewToSim;
+float4x4 ViewToClip;
+float4 InvDeviceZToWorldZTransform;
+uint   MaxSteps;
+Texture2D SceneDepthTexture;
+RWTexture2D<float> DepthOut;
+RWTexture2D<float> ThicknessOut;
+RWTexture2D<float4> NormalOut;
+
+float DeviceZToViewZ(float DeviceZ)
+{
+	return DeviceZ * InvDeviceZToWorldZTransform[0] + InvDeviceZToWorldZTransform[1]
+		+ 1.0f / (DeviceZ * InvDeviceZToWorldZTransform[2] - InvDeviceZToWorldZTransform[3]);
+}
+
+float3 ViewRay(int2 Pixel)   // view-space direction with z = 1
+{
+	float2 Uv = (float2(Pixel - ViewRectMin) + 0.5) / float2(ViewSize);
+	float2 Ndc = float2(Uv.x * 2.0 - 1.0, 1.0 - Uv.y * 2.0);
+	return float3((Ndc.x - ViewToClip[2][0]) / ViewToClip[0][0], (Ndc.y - ViewToClip[2][1]) / ViewToClip[1][1], 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void RaymarchCS(uint3 DTid : SV_DispatchThreadID)
+{
+	if (any(int2(DTid.xy) >= ViewSize))
+	{
+		return;
+	}
+	int2 Pixel = int2(DTid.xy) + ViewRectMin;
+	DepthOut[Pixel] = NO_FLUID_DEPTH;
+	ThicknessOut[Pixel] = 0.0;
+	NormalOut[Pixel] = float4(0, 0, -1, 0);
+
+	float3 Ray = ViewRay(Pixel);
+	// Ray in voxel space, parameterised by view depth t (cm): P(t) = O + D t.
+	float3 O = mul(float4(0, 0, 0, 1), ViewToSim).xyz * InvVoxelSize;
+	float3 D = mul(float4(Ray, 0), ViewToSim).xyz * InvVoxelSize;
+	float3 InvD = 1.0 / (abs(D) > 1e-9 ? D : 1e-9);
+	float3 T0 = (0.0 - O) * InvD;
+	float3 T1 = (float3(FieldDim) - O) * InvD;
+	float TEnter = max(max(max(min(T0.x, T1.x), min(T0.y, T1.y)), min(T0.z, T1.z)), 1.0);
+	float TExit = min(min(max(T0.x, T1.x), max(T0.y, T1.y)), max(T0.z, T1.z));
+	float SceneZ = DeviceZToViewZ(SceneDepthTexture.Load(int3(Pixel, 0)).r);
+	TExit = min(TExit, SceneZ);
+	if (TEnter >= TExit)
+	{
+		return;
+	}
+
+	float VoxelPerT = length(D);
+	float Step = 0.5 / VoxelPerT;   // half a voxel
+	float T = TEnter;
+	float PrevT = T;
+	bool bHit = false;
+	for (uint I = 0; I < MaxSteps && T < TExit; ++I)
+	{
+		float3 P = O + D * T;
+		if (!BrickOccupied(P))
+		{
+			// Jump to the exit of this empty brick.
+			float3 B = floor(P / 8.0) * 8.0;
+			float3 Far = B + (D > 0.0 ? 8.0 : 0.0);
+			float3 TB = (Far - O) * InvD;
+			float TNext = min(min(D.x != 0.0 ? TB.x : 1e30, D.y != 0.0 ? TB.y : 1e30), D.z != 0.0 ? TB.z : 1e30);
+			PrevT = T;
+			T = max(TNext, T + Step * 0.25) + Step * 0.01;
+			continue;
+		}
+		if (SampleField(P) >= IsoLevel)
+		{
+			bHit = true;
+			break;
+		}
+		PrevT = T;
+		T += Step;
+	}
+	if (!bHit)
+	{
+		return;
+	}
+	// Bisection between the last outside sample and the first inside one.
+	float Lo = PrevT, Hi = T;
+	[unroll]
+	for (int K = 0; K < 6; ++K)
+	{
+		float Mid = 0.5 * (Lo + Hi);
+		if (SampleField(O + D * Mid) >= IsoLevel)
+		{
+			Hi = Mid;
+		}
+		else
+		{
+			Lo = Mid;
+		}
+	}
+	float THit = Hi;
+	float3 PHit = O + D * THit;
+
+	// Thickness: walk through the liquid in one-voxel steps until it ends or meets the scene.
+	float TIn = THit;
+	float Thick = 0.0;
+	float InnerStep = 1.0 / VoxelPerT;
+	[loop]
+	for (int J = 0; J < 96; ++J)
+	{
+		TIn += InnerStep;
+		if (TIn >= SceneZ || SampleField(O + D * TIn) < IsoLevel)
+		{
+			break;
+		}
+	}
+	Thick = (min(TIn, SceneZ) - THit) * length(Ray);
+
+	float3 G = FieldGradient(PHit);
+	float3 N = mul(float4(-G, 0.0), SimToView).xyz;
+	N = length(N) > 1e-8 ? normalize(N) : float3(0, 0, -1);
+	if (N.z > 0.0)
+	{
+		N = -N;
+	}
+	DepthOut[Pixel] = THit;
+	ThicknessOut[Pixel] = Thick;
+	NormalOut[Pixel] = float4(N, 1.0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Surface nets
+// ---------------------------------------------------------------------------------------------
+uint   MaxVertices;
+uint   MaxIndices;
+float  VoxelSizeCm;
+float3 LocalOffsetCm;       // volume-local cm of voxel-space origin
+RWStructuredBuffer<uint> CellVertex;
+RWStructuredBuffer<uint> Counters;    // [0] vertices, [1] indices
+RWBuffer<float> PositionsOut;
+RWBuffer<float4> TangentsOut;
+RWBuffer<float2> TexCoordsOut;
+RWBuffer<uint> IndicesOut;
+RWBuffer<uint> ArgsOut;
+
+uint CellIndex(int3 C)
+{
+	int3 CellDim = FieldDim - 1;
+	return uint(C.x + CellDim.x * (C.y + CellDim.y * C.z));
+}
+
+[numthreads(4, 4, 4)]
+void SurfaceNetsVerticesCS(uint3 DTid : SV_DispatchThreadID)
+{
+	int3 C = int3(DTid);
+	if (any(C >= FieldDim - 1))
+	{
+		return;
+	}
+	uint Ci = CellIndex(C);
+	CellVertex[Ci] = 0xFFFFFFFFu;
+	if (BrickOccupancyIn[BrickIndexOfVoxel(C, BrickDim)] == 0u)
+	{
+		return;
+	}
+	float Fc[8];
+	uint Mask = 0u;
+	[unroll]
+	for (int K = 0; K < 8; ++K)
+	{
+		Fc[K] = Field.Load(int4(C + int3(K & 1, (K >> 1) & 1, K >> 2), 0));
+		Mask |= (Fc[K] >= IsoLevel ? 1u : 0u) << K;
+	}
+	if (Mask == 0u || Mask == 0xFFu)
+	{
+		return;
+	}
+	float3 Sum = 0.0;
+	float Count = 0.0;
+	[unroll]
+	for (int A = 0; A < 8; ++A)
+	{
+		[unroll]
+		for (int Bit = 1; Bit <= 4; Bit <<= 1)
+		{
+			if ((A & Bit) != 0)
+			{
+				continue;
+			}
+			int B = A | Bit;
+			if (((Mask >> A) & 1u) != ((Mask >> B) & 1u))
+			{
+				float T = saturate((IsoLevel - Fc[A]) / (Fc[B] - Fc[A]));
+				float3 Pa = float3(A & 1, (A >> 1) & 1, A >> 2);
+				float3 Pb = float3(B & 1, (B >> 1) & 1, B >> 2);
+				Sum += lerp(Pa, Pb, T);
+				Count += 1.0;
+			}
+		}
+	}
+	uint Vi;
+	InterlockedAdd(Counters[0], 1u, Vi);
+	if (Vi >= MaxVertices)
+	{
+		return;
+	}
+	CellVertex[Ci] = Vi;
+
+	float3 Pv = float3(C) + 0.5 + Sum / Count;   // voxel space
+	float3 Local = Pv * VoxelSizeCm + LocalOffsetCm;
+	PositionsOut[Vi * 3u + 0u] = Local.x;
+	PositionsOut[Vi * 3u + 1u] = Local.y;
+	PositionsOut[Vi * 3u + 2u] = Local.z;
+
+	float3 G = FieldGradient(Pv);
+	float3 N = length(G) > 1e-8 ? -normalize(G) : float3(0, 0, 1);
+	float3 TX = normalize(cross(N, abs(N.z) < 0.9 ? float3(0, 0, 1) : float3(1, 0, 0)));
+	TangentsOut[Vi * 2u + 0u] = float4(TX, 0.0);
+	TangentsOut[Vi * 2u + 1u] = float4(N, 1.0);
+	TexCoordsOut[Vi] = float2(Local.x + Local.z, Local.y + Local.z) * 0.01;
+}
+
+[numthreads(4, 4, 4)]
+void SurfaceNetsFacesCS(uint3 DTid : SV_DispatchThreadID)
+{
+	int3 C = int3(DTid);
+	if (any(C >= FieldDim - 1))
+	{
+		return;
+	}
+	if (BrickOccupancyIn[BrickIndexOfVoxel(C, BrickDim)] == 0u)
+	{
+		return;
+	}
+	float F0 = Field.Load(int4(C, 0));
+	bool bIn0 = F0 >= IsoLevel;
+	[unroll]
+	for (int Axis = 0; Axis < 3; ++Axis)
+	{
+		int3 E = int3(Axis == 0, Axis == 1, Axis == 2);
+		bool bIn1 = Field.Load(int4(C + E, 0)) >= IsoLevel;
+		if (bIn0 == bIn1)
+		{
+			continue;
+		}
+		// The four cells around this edge lie at -1 along the two other axes.
+		int3 Eu = int3(Axis == 2, Axis == 0, Axis == 1);
+		int3 Ev = int3(Axis == 1, Axis == 2, Axis == 0);
+		int3 C10 = C - Eu, C11 = C - Eu - Ev, C01 = C - Ev;
+		if (any(C11 < 0))
+		{
+			continue;
+		}
+		uint V00 = CellVertex[CellIndex(C)];
+		uint V10 = CellVertex[CellIndex(C10)];
+		uint V11 = CellVertex[CellIndex(C11)];
+		uint V01 = CellVertex[CellIndex(C01)];
+		if (V00 == 0xFFFFFFFFu || V10 == 0xFFFFFFFFu || V11 == 0xFFFFFFFFu || V01 == 0xFFFFFFFFu)
+		{
+			continue;
+		}
+		uint Base;
+		InterlockedAdd(Counters[1], 6u, Base);
+		if (Base + 6u > MaxIndices)
+		{
+			continue;
+		}
+		// Winding faces away from the inside voxel.
+		if (bIn0)
+		{
+			IndicesOut[Base + 0u] = V00; IndicesOut[Base + 1u] = V11; IndicesOut[Base + 2u] = V10;
+			IndicesOut[Base + 3u] = V00; IndicesOut[Base + 4u] = V01; IndicesOut[Base + 5u] = V11;
+		}
+		else
+		{
+			IndicesOut[Base + 0u] = V00; IndicesOut[Base + 1u] = V10; IndicesOut[Base + 2u] = V11;
+			IndicesOut[Base + 3u] = V00; IndicesOut[Base + 4u] = V11; IndicesOut[Base + 5u] = V01;
+		}
+	}
+}
+
+[numthreads(1, 1, 1)]
+void SurfaceNetsArgsCS()
+{
+	uint NumIndices = min(Counters[1], MaxIndices);
+	NumIndices -= NumIndices % 3u;
+	ArgsOut[0] = NumIndices;   // IndexCountPerInstance
+	ArgsOut[1] = 1u;           // InstanceCount
+	ArgsOut[2] = 0u;           // StartIndexLocation
+	ArgsOut[3] = 0u;           // BaseVertexLocation
+	ArgsOut[4] = 0u;           // StartInstanceLocation
+}
